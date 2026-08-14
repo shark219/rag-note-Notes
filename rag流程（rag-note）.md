@@ -22,31 +22,32 @@ RAG 通过"先检索、后生成"，让 LLM 基于真实文档回答，大幅降
     │
     ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│  Query 扩展（QueryExpander）                                    │
-│  └─ LLM 生成 3 个语义等价版本（不超过20字）                       │
-│     Q1: "什么是向量数据库？"（原始）                              │
-│     Q2: "向量数据库的定义是什么？"                                │
-│     Q3: "请解释向量数据库的概念"                                  │
+│  Query 扩展（QueryExpander，可由消融配置关闭）                    │
+│  └─ 查询缓存命中则直接复用；未命中时调用 creativeModel           │
+│     原始查询始终保留，再尝试追加最多 3 个扩展查询                  │
+│     扩展查询要求 10~30 字，代码最终截断到最多 50 字               │
+│     扩展失败 → 仅使用原始查询                                     │
 └─────────────────────────────────────────────────────────────────┘
     │
     ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │  混合检索（HybridRetriever）- 并行执行                            │
 │                                                                 │
-│  知识库检索（topK = 配置值，如 5）：                              │
-│  ├─ 4个查询版本 × 2（向量+BM25）= 8路检索                        │
-│  ├─ RRF 融合：合并去重，按 RRF 分数排序，取 topK×2 条            │
+│  知识库检索（默认 topK = 5，可由消融配置覆盖）：                  │
+│  ├─ 每个查询版本分别走向量检索和 BM25（各取 effectiveTopK×2）    │
+│  ├─ RRF 融合（默认 rrfK=30）：去重后保留 effectiveTopK×2 条       │
+│  ├─ 可按文档 ID、MD5、文件名或原始文件名筛选                      │
 │                                                                 │
-│  笔记检索（topK = 3）：                                          │
-│  ├─ 4个查询版本 × 2（向量+BM25）= 8路检索                        │
-│  ├─ RRF 融合：合并去重，按 RRF 分数排序，取 topK×2 条            │
+│  笔记检索（默认使用同一 topK）：                                 │
+│  ├─ 每个查询版本分别走向量检索和 BM25                             │
+│  ├─ RRF 融合后再精排；Chroma 不可用时会降级为关键词检索            │
 └─────────────────────────────────────────────────────────────────┘
     │
     ▼
 ┌─────────────────────────────────────────┐
 │ RerankerService (智谱AI Cross-Encoder)   │
 │                                          │
-│  1. 调用 rerank API 重新打分              │
+│  1. 调用 rerank API 重新打分（当前 reranker 结果写入 rerank_score）              │
 │  2. 动态 top-N 策略：                    │
 │     - score > 0.7 → 全部保留             │
 │     - 0.5 ≤ score ≤ 0.7 → 最多保留2条    │
@@ -55,9 +56,11 @@ RAG 通过"先检索、后生成"，让 LLM 基于真实文档回答，大幅降
     │
     ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│  合并结果（按 rerank_score 统一排序）                             │
-│  ├─ 笔记结果 + 知识库结果                                        │
-│  └─ 按精排分数统一排序                                           │
+│  合并结果（RagService）                                           │
+│  ├─ 知识库和笔记结果合并                                          │
+│  ├─ 可按用户开关、文档/笔记选择范围过滤                            │
+│  ├─ 按 similarity 优先，其次 rerank_score / rrf_score 排序          │
+│  └─ 最终截断为 topK，并扩展命中 chunk 的邻域上下文                 │
 └─────────────────────────────────────────────────────────────────┘
     │
     ▼
@@ -70,11 +73,20 @@ RAG 通过"先检索、后生成"，让 LLM 基于真实文档回答，大幅降
     │
     ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│  返回最终回答 + 检索结果                                          │
+│  RagService 返回回答、文档、检索/生成耗时和 token 统计              │
+│  Agent 模式再由 Composer/Writer 组织最终答案，通过 SSE 返回         │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
 ---
+
+## 当前项目真实调用链
+
+当前前端主对话入口是 chat/agent/query/stream。Agent 层按需调用 RAG 工具：
+
+前端 AIChat.vue → ChatController → AgentService → SupervisorService 语义分诊 → AgentLoop（最多 10 轮）→ AgentTools.ragSummary() → RagService → HybridRetriever → ResponseComposer 或 WriterService → SSE。
+
+请求还可携带 enableKnowledge、enableNotes、selectedKnowledgeDocs、selectedNotes 和 fileIds；附件会先提取文本并注入执行查询。简单任务通常走单 Agent，复合任务可走 SEQUENTIAL 或 PARALLEL 多 Agent 管道。另有 chat/rag/query 兼容接口，直接调用 ChatService.ragQuery()，不经过 Agent。Agent 的 response 不是 LLM token 级流式，而是生成完成后按每 50 个字符切块、间隔 50ms 发送。
 
 ## 二、数据存储架构
 
@@ -107,7 +119,7 @@ RAG 通过"先检索、后生成"，让 LLM 基于真实文档回答，大幅降
 
 ### 向量存储策略
 
-**当前实现**：默认使用 ChromaDB，连接失败时自动降级为 MySQL + 余弦相似度
+**当前实现**：知识库和笔记分别使用 ChromaDB collection；知识库在 Chroma 不可用时可降级为 MySQL + 余弦相似度，笔记向量检索则禁用并继续依赖 BM25/关键词兜底。Chroma 是否可用在服务启动时初始化
 
 ```
 // VectorStoreService 构造函数
@@ -133,8 +145,8 @@ try {
 
 - 笔记添加：跳过向量写入，只写 MySQL 和 BM25
 - 知识库添加：跳过向量写入，写入 MySQL 和 BM25，标记 vector_failed
-- 知识库检索：自动降级到 MySQL + 余弦相似度（逐条 embedding 后计算）
-- 笔记检索：返回空列表，不支持向量检索
+- 知识库检索：HybridRetriever 关闭向量路，改走 BM25；若 BM25 不可用则走 MySQL 关键词检索。VectorStoreService 的知识库直接调用也支持 MySQL + 余弦相似度降级
+- 笔记检索：VectorStoreService 的 Chroma 向量路返回空列表，但 HybridRetriever 仍可使用 BM25 或 MySQL 关键词兜底
 
 ### 笔记与知识库存储对比
 
@@ -151,6 +163,8 @@ try {
 ---
 
 ## 三、文档处理流程（DocumentProcessor）
+
+> 当前知识库实际使用 `RagChunker.splitKnowledge()`，不是下方旧示例中的简单 `splitTextWithPrefix()`。PDF 使用 PDFBox 按页提取、NFKC 归一化并保留 `[Page x/y]`；其他格式使用 Apache Tika。RagChunker 会识别 Markdown block、代码、表格、列表和页码元数据，知识库 chunk 本身是扁平结构。
 
 ### 流程概述
 
@@ -191,11 +205,11 @@ try {
 │  Step 3: 保存 MD5 记录                                              │
 │ └─ md5Store.save(md5, filename, originalFilename, userId)       │
 │                                                                 │
-│  Step 4: 异步写入 ChromaDB（DocumentTaskExecutor，独立线程）         │
+│  Step 4: 异步写入 ChromaDB（DocumentTaskExecutor，独立线程池）         │
 │  ├─ 批量 Embedding（每批 10 个 chunks）                              │
 │  ├─ 分批写入 ChromaDB                                               │
 │ └─ 成功 → status = "completed"                                    │
-│      失败 → status = "vector_failed"（支持重试）                     │
+│      失败 → status = "vector_failed"（可调用 retryVectorization 重试）                     │
 ```
 
 ### 详细代码流程
@@ -242,6 +256,8 @@ public CompletableFuture<Void> processFile(File file, String originalFilename,
 ```
 
 ### 切片策略详解
+
+知识库和笔记共用 RagChunker，但策略不同：知识库重点保留 PDF 页码和结构化 block；笔记按 Markdown 标题维护 sectionPath，并保存前后 chunk 关系。检索命中后，VectorStoreService 会对知识库扩展 chunk_index ±1 邻域，对笔记优先扩展同章节或前后邻域，且有字符上限。
 
 **问题**：英文 RAG 常用的 `RecursiveCharacterTextSplitter` 按空格/换行切分，对中文效果很差——会把一个句子从中间切断，破坏语义完整性。
 
@@ -447,7 +463,7 @@ EmbeddingSearchRequest request = EmbeddingSearchRequest.builder()
 笔记检索 → RRF 融合 → Cross-Encoder 精排 → topK 条
     │
     ▼
-按 RRF 分数统一排序，取最终 topK
+先按 similarity 优先、再按 rerank_score 和 rrf_score 取分，最终截断为 topK
 ```
 
 ---
@@ -457,6 +473,8 @@ EmbeddingSearchRequest request = EmbeddingSearchRequest.builder()
 ### 是什么
 
 RRF（Reciprocal Rank Fusion）= 逆排名融合。一种将多路检索结果合并排序的算法。
+
+本项目默认 `RRF_K=30`（不是常见示例中的 60），消融配置可以覆盖知识库检索的 rrfK。
 
 RRF 的核心思想：
 
@@ -473,7 +491,7 @@ score(d) = Σ 1/(k + rank_i(d))
 
 其中：
 - d = 文档
-- k = 常数 60（经验值，避免排名靠前的文档分数过高）
+- k = 默认常数 30，可由知识库消融配置覆盖
 - rank_i(d) = 文档 d 在第 i 路检索结果中的排名（从 1 开始）
 - Σ = 对所有路的分数求和
 ```
@@ -704,11 +722,13 @@ ChromaCleanupScheduler
 
 ---
 
-## 十、质量审查（QualityReviewer）【可选，默认关闭】
+## 十、质量审查（QualityReviewer）
+
+> 配置项 `retrieval-review-enabled` 虽然存在且默认关闭，但当前主流程没有调用 `reviewRetrieval()`；实际可见的质量审查发生在 Agent 合成回答阶段，调用 `reviewAnswer()`，审查不通过时重新组织或合成回答。
 
 ### 概述
 
-`QualityReviewer` 是一个可选的质量审查组件，可在检索和生成两个阶段对 RAG 输出进行 LLM 驱动的质量审查。默认关闭（`retrieval-review-enabled: false`）。
+`QualityReviewer` 是一个可选的质量审查组件，可在检索和生成两个阶段对 RAG 输出进行 LLM 驱动的质量审查。配置项默认关闭，但当前主流程未调用检索审查；Agent 合成阶段会调用回答审查。
 
 ### 审查流程
 
@@ -720,6 +740,7 @@ ChromaCleanupScheduler
 │  QualityReviewer                                                 │
 │                                                                 │
 │  reviewRetrieval(query, documents)                               │
+│  └─ 当前主流程未调用，仅保留为可复用组件                         │
 │  ├─ 检查文档是否为空 → 空则直接不通过                             │
 │  ├─ 调用 LLM（preciseModel）审查文档质量                          │
 │  ├─ 返回 ReviewResult(approved, reason, feedback)                │
@@ -737,8 +758,8 @@ ChromaCleanupScheduler
 
 ### 关键特性
 
-- **双阶段审查**：检索阶段审查文档相关性，生成阶段审查回答质量
-- **查询改写**：审查不通过时，可基于 LLM 反馈改写查询自动重试
+- **当前实际行为**：Agent 合成阶段调用回答审查；检索审查方法尚未接入主流程
+- **查询改写方法**：组件提供 rewriteQuery，但当前主流程未形成检索失败后的自动重试链路
 - **默认关闭**：通过 `app.ablation.rag.retrieval-review-enabled` 控制开关（默认 false）
 - **异常安全**：LLM 调用异常时默认通过（approved=true），不阻断主流程
 
@@ -813,7 +834,7 @@ HTTP 请求进入 Tomcat
 用户问题: "怎么提升记忆力"
     │
     └─── [Multi-Query] ────────────────────────────────────────
-         LLM 改写为 3 个语义等价版本（不超过20字）:
+         LLM 尝试生成最多 3 个扩展版本（提示词要求 10~30 字，代码最多保留 50 字）:
          Q1: "记忆增强的方法有哪些"
          Q2: "提高记忆效率的技巧"
          Q3: "如何改善记忆能力"
@@ -1237,6 +1258,8 @@ WHERE status = 'failed' AND created_at < NOW() - 7 DAY
 |删除 ChromaDB|残留超 7 天|每天凌晨 3 点自动清理 failed 记录|
 
 ## 十五、Ragas评估流程
+
+当前评估并非直接接入前端 Agent/SSE 链路。RegressionTestService 直接调用 RagService.getDocumentsAndSummary()，再手动构造 RagTrace，调用 EvaluationService.evaluate()；因此回归测试覆盖检索和生成，但不覆盖 Supervisor、AgentLoop、Composer、Writer、SSE 和 Agent 质量审查。生产 trace 由 RagService 保存，记录查询、检索文档预览、耗时、平均相似度、最终回答和 token 消耗。
 
 ```
 RagTrace (查询记录)
