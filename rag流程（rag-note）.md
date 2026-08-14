@@ -1,1325 +1,932 @@
 # RAG 检索增强生成
 
-## 一、整体流程总览
+## 一、项目现状
 
-### 是什么
+当前仓库主工程在 `LangChain-RAG-FastAPI-Service-master/`，实际是：
 
-RAG（Retrieval-Augmented Generation）= 检索增强生成。核心思想：先从知识库中检索相关文档，再把文档交给 LLM 生成回答，而不是让 LLM 凭空回答。
+- Java 后端：Spring Boot 3.4 + Java 17
+- 前端：Vue 3 + Vite + TypeScript，主界面在 `front-v2/`
+- 主对话入口：`POST /chat/agent/query/stream`
+- 兼容直连 RAG 入口：`POST /chat/rag/query`
 
-### 为什么
+这项目现在不是“用户提问后直接进 RAG 再直接吐回答”那种纯直线流程。主链路已经变成：
 
-纯 LLM 有两个致命问题：
+1. 前端发起 Agent 对话请求
+2. `ChatController` 进入 `AgentService`
+3. Agent Runtime/Loop 决定是否调用 `ragSummary` 工具
+4. 工具内部再走 `RagService`
+5. `RagService` 调 `HybridRetriever`
+6. 检索结果回到 Agent 侧，由 `ResponseComposer` 组织答案
+7. `QualityReviewer.reviewAnswer()` 做回答审查
+8. 最后通过 SSE 返回前端
 
-1. **知识截止**：LLM 的训练数据有截止日期，无法回答关于最新内容的问题
-2. **幻觉**：LLM 会编造看似合理但错误的内容
+所以现在项目里有两条 RAG 路：
 
-RAG 通过"先检索、后生成"，让 LLM 基于真实文档回答，大幅降低幻觉率。
-
-### 本项目的 RAG 流程
-
-```
-用户提问："什么是向量数据库？"
-    │
-    ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  Query 扩展（QueryExpander，可由消融配置关闭）                    │
-│  └─ 查询缓存命中则直接复用；未命中时调用 creativeModel           │
-│     原始查询始终保留，再尝试追加最多 3 个扩展查询                  │
-│     扩展查询要求 10~30 字，代码最终截断到最多 50 字               │
-│     扩展失败 → 仅使用原始查询                                     │
-└─────────────────────────────────────────────────────────────────┘
-    │
-    ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  混合检索（HybridRetriever）- 并行执行                            │
-│                                                                 │
-│  知识库检索（默认 topK = 5，可由消融配置覆盖）：                  │
-│  ├─ 每个查询版本分别走向量检索和 BM25（各取 effectiveTopK×2）    │
-│  ├─ RRF 融合（默认 rrfK=30）：去重后保留 effectiveTopK×2 条       │
-│  ├─ 可按文档 ID、MD5、文件名或原始文件名筛选                      │
-│                                                                 │
-│  笔记检索（默认使用同一 topK）：                                 │
-│  ├─ 每个查询版本分别走向量检索和 BM25                             │
-│  ├─ RRF 融合后再精排；Chroma 不可用时会降级为关键词检索            │
-└─────────────────────────────────────────────────────────────────┘
-    │
-    ▼
-┌─────────────────────────────────────────┐
-│ RerankerService (智谱AI Cross-Encoder)   │
-│                                          │
-│  1. 调用 rerank API 重新打分（当前 reranker 结果写入 rerank_score）              │
-│  2. 动态 top-N 策略：                    │
-│     - score > 0.7 → 全部保留             │
-│     - 0.5 ≤ score ≤ 0.7 → 最多保留2条    │
-│     - score < 0.5 → 丢弃                 │
-└────────────────────────────────────────┘
-    │
-    ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  合并结果（RagService）                                           │
-│  ├─ 知识库和笔记结果合并                                          │
-│  ├─ 可按用户开关、文档/笔记选择范围过滤                            │
-│  ├─ 按 similarity 优先，其次 rerank_score / rrf_score 排序          │
-│  └─ 最终截断为 topK，并扩展命中 chunk 的邻域上下文                 │
-└─────────────────────────────────────────────────────────────────┘
-    │
-    ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  系统提示词 + 直接拼接 → LLM 生成回答                            │
-│  ├─ 系统提示词：定义回答规则（只基于参考资料、引用来源等）         │
-│  ├─ 参考资料：带来源标注的 chunk 内容                             │
-│  └─ 一次 LLM 调用生成最终回答                                    │
-└─────────────────────────────────────────────────────────────────┘
-    │
-    ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  RagService 返回回答、文档、检索/生成耗时和 token 统计              │
-│  Agent 模式再由 Composer/Writer 组织最终答案，通过 SSE 返回         │
-└─────────────────────────────────────────────────────────────────┘
-```
+- Agent 路：主路径，带规划、工具、Composer、回答审查
+- 直连路：`chat/rag/query`，直接 `ChatService.ragQuery()`，不经过 Agent
 
 ---
 
-## 当前项目真实调用链
+## 二、当前真实调用链
 
-当前前端主对话入口是 chat/agent/query/stream。Agent 层按需调用 RAG 工具：
+### 1. 主链路：Agent + RAG
 
-前端 AIChat.vue → ChatController → AgentService → SupervisorService 语义分诊 → AgentLoop（最多 10 轮）→ AgentTools.ragSummary() → RagService → HybridRetriever → ResponseComposer 或 WriterService → SSE。
+代码入口：`backend-java/src/main/java/com/rag/notebook/chat/controller/ChatController.java`
 
-请求还可携带 enableKnowledge、enableNotes、selectedKnowledgeDocs、selectedNotes 和 fileIds；附件会先提取文本并注入执行查询。简单任务通常走单 Agent，复合任务可走 SEQUENTIAL 或 PARALLEL 多 Agent 管道。另有 chat/rag/query 兼容接口，直接调用 ChatService.ragQuery()，不经过 Agent。Agent 的 response 不是 LLM token 级流式，而是生成完成后按每 50 个字符切块、间隔 50ms 发送。
-
-## 二、数据存储架构
-
-### 存储层概览
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                          数据存储层                              │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│   ┌──────────────┐    ┌──────────────┐    ┌──────────────┐     │
-│   │    MySQL     │    │   ChromaDB   │    │    BM25      │     │
-│   │   (内容存储)  │    │  (向量存储)   │    │  (关键词索引) │     │
-│   └──────┬───────┘    └──────┬───────┘    └──────┬───────┘     │
-│          │                   │                   │             │
-│   ┌──────┴───────┐    ┌──────┴───────┐    ┌──────┴───────┐     │
-│   │ KnowledgeDoc │    │knowledgeStore│    │  磁盘持久化   │     │
-│   │ DocChunk     │    │   noteStore  │    │data/bm25_idx │     │
-│   │ Note         │    │              │    │              │     │
-│   │ NoteChunk    │    │              │    │              │     │
-│   └──────────────┘    └──────────────┘    └──────────────┘     │
-│                                                                 │
-│   ┌──────────────┐    ┌──────────────┐    ┌──────────────┐     │
-│   │ md5_hex_store│    │ Redis        │    │ cleanup_task │     │
-│   │  (MD5去重)   │    │ (缓存+黑名单) │    │ (删除重试)   │     │
-│   └──────────────┘    └──────────────┘    └──────────────┘     │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### 向量存储策略
-
-**当前实现**：知识库和笔记分别使用 ChromaDB collection；知识库在 Chroma 不可用时可降级为 MySQL + 余弦相似度，笔记向量检索则禁用并继续依赖 BM25/关键词兜底。Chroma 是否可用在服务启动时初始化
-
-```
-// VectorStoreService 构造函数
-try {
-    String chromaUrl = props.getChroma().getUrl();
-    this.noteStore = ChromaEmbeddingStore.builder()
-            .baseUrl(chromaUrl)
-            .collectionName(props.getChroma().getNotesCollection())
-            .build();
-    this.knowledgeStore = ChromaEmbeddingStore.builder()
-            .baseUrl(chromaUrl)
-            .collectionName(props.getChroma().getCollection())
-            .build();
-    this.chromaAvailable = true;
-} catch (Exception e) {
-    log.warn("ChromaDB 连接失败，降级为内存向量存储: {}", e.getMessage());
-    this.noteStore = null;
-    this.knowledgeStore = null;
-}
-```
-
-**ChromaDB 不可用时的行为**：
-
-- 笔记添加：跳过向量写入，只写 MySQL 和 BM25
-- 知识库添加：跳过向量写入，写入 MySQL 和 BM25，标记 vector_failed
-- 知识库检索：HybridRetriever 关闭向量路，改走 BM25；若 BM25 不可用则走 MySQL 关键词检索。VectorStoreService 的知识库直接调用也支持 MySQL + 余弦相似度降级
-- 笔记检索：VectorStoreService 的 Chroma 向量路返回空列表，但 HybridRetriever 仍可使用 BM25 或 MySQL 关键词兜底
-
-### 笔记与知识库存储对比
-
-|   |   |   |
-|---|---|---|
-|维度|知识库文档|笔记|
-|**内容存储**|MySQL（KnowledgeDocument + KnowledgeDocumentChunk）|MySQL（Note + NoteChunk）|
-|**向量存储**|ChromaDB（knowledgeStore）|ChromaDB（noteStore）|
-|**BM25**|Bm25Service（按 chunk_id）|Bm25Service（按 chunk_id）|
-|**切片策略**|按标点层级切分（chunkSize=200, overlap=20）|与知识库一致|
-|**删除方式**|REST API（按 doc_id 批量删除）|REST API（按 note_id 批量删除）|
-|**重试机制**|chroma_cleanup_task 表|chroma_cleanup_task 表|
-
----
-
-## 三、文档处理流程（DocumentProcessor）
-
-> 当前知识库实际使用 `RagChunker.splitKnowledge()`，不是下方旧示例中的简单 `splitTextWithPrefix()`。PDF 使用 PDFBox 按页提取、NFKC 归一化并保留 `[Page x/y]`；其他格式使用 Apache Tika。RagChunker 会识别 Markdown block、代码、表格、列表和页码元数据，知识库 chunk 本身是扁平结构。
-
-### 流程概述
-
-```
-用户上传文件
-    │
-    ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  DocumentProcessor.processFile()                                │
-│  1. 计算文件 MD5                                                │
-│  2. MD5 去重检查（md5Store + MySQL）                             │
-│  3. 文本提取（Apache Tika）     
-          Tika 是 Apache 的文档解析库，支持 1000+ 种文件格式：
-              .pdf   → PDFParser   → 提取文字 + 元数据
-              .docx  → OOXMLParser → 提取段落
-              .pptx  → OOXMLParser → 提取幻灯片内容
-              .txt   → TextParser   → 直接读取
-              .md    → TextParser   → 直接读取
-              .html  → HtmlParser   → 提取正文
-          统一接口: tika.parseToString(file) → 返回纯文本，不需要为每种格式写单独的解析代码
-│  4. 文本切分（按段落/句子，支持重叠）
-          长文档切成小块 → 每个块添加 [文件: 原始文件名] 前缀（用于来源追溯）
-                          → 每个块作为一个检索单位存起来
-  				用户提问时 → 找到最相关的块 → 把块的内容喂给 LLM → LLM 基于内容生成回答
-└─────────────────────────────────────────────────────────────────┘
-    │
-    ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  VectorStoreService.addKnowledgeDocument()                      │
-│                                                                 │
-│  Step 1: 写入 MySQL（事务保证）                                  │
-│  ├─ KnowledgeDocument（文档元数据，status="processing"）         │
-│  └─ KnowledgeDocumentChunk（切片内容）                           │
-│                                                                 │
-│  Step 2: 写入 BM25 索引（同步，事务内）                              │
-│  └─ 每个 chunk 写入 Lucene 磁盘索引                                 │
-│                                                                 │
-│  Step 3: 保存 MD5 记录                                              │
-│ └─ md5Store.save(md5, filename, originalFilename, userId)       │
-│                                                                 │
-│  Step 4: 异步写入 ChromaDB（DocumentTaskExecutor，独立线程池）         │
-│  ├─ 批量 Embedding（每批 10 个 chunks）                              │
-│  ├─ 分批写入 ChromaDB                                               │
-│ └─ 成功 → status = "completed"                                    │
-│      失败 → status = "vector_failed"（可调用 retryVectorization 重试）                     │
-```
-
-### 详细代码流程
-
-```
-// DocumentProcessor.processFile()
-public CompletableFuture<Void> processFile(File file, String originalFilename,
-                                           String userId,
-                                           BiConsumer<String, Object> progressCallback) {
-    // ① 计算 MD5
-    String md5 = computeMd5(file);
-    
-    // ② MD5 去重检查（双重校验）
-    if (md5Store.exists(md5, userId)
-            && vectorStoreService.hasKnowledgeDocument(userId, md5)) {
-        progressCallback.accept("skipping", originalFilename);
-        return CompletableFuture.completedFuture(null);
-    }
-    // MD5 存在但向量数据丢失 → 清理后重新处理
-    if (md5Store.exists(md5, userId)) {
-        md5Store.deleteByMd5(md5, userId);
-    }
-    
-    // ③ Tika 解析提取文本
-    String content = tika.parseToString(file);
-    
-    // ④ 中文感知分块（每块添加文件名前缀，便于来源追溯）
-    String filePrefix = "[文件: " + originalFilename + "]
-";
-    List<String> chunks = splitTextWithPrefix(content, chunkSize, chunkOverlap, filePrefix);
-    
-    // ⑤ MySQL + BM25 同步写入（同一事务）
-    String docId = vectorStoreService.addKnowledgeDocument(userId, originalFilename,
-            md5, chunks, metadata, progressCallback);
-    if (docId == null) return CompletableFuture.completedFuture(null);
-    
-    // ⑥ 保存 MD5 记录（同步）
-    md5Store.save(md5, originalFilename, originalFilename, userId);
-    
-    // ⑦ ChromaDB 异步写入（DocumentTaskExecutor 独立线程，不占用事务连接）
-    return documentTaskExecutor.writeToChromaAsync(userId, originalFilename,
-            md5, docId, chunks, progressCallback);
-}
-```
-
-### 切片策略详解
-
-知识库和笔记共用 RagChunker，但策略不同：知识库重点保留 PDF 页码和结构化 block；笔记按 Markdown 标题维护 sectionPath，并保存前后 chunk 关系。检索命中后，VectorStoreService 会对知识库扩展 chunk_index ±1 邻域，对笔记优先扩展同章节或前后邻域，且有字符上限。
-
-**问题**：英文 RAG 常用的 `RecursiveCharacterTextSplitter` 按空格/换行切分，对中文效果很差——会把一个句子从中间切断，破坏语义完整性。
-
-**解决**：按中文标点层级切分：
-
-- 优先级：`\n\n` → `\n` → `。` → `！` → `？` → `.` → `!` → `?` → `；` → `;` → `，` → `,`
-
-**为什么需要 overlap（重叠）**：
-
-```
-chunk1: "...机器学习是人工智能的一个子集，它通过"
-chunk2: "它通过数据训练模型来做出预测..."
-        ^^^^^^^^ 重叠部分 ^^^^^^^^
-```
-
-没有 overlap，"它通过"这个指代关系就断了。检索到 chunk2 时 LLM 不知道"它"指什么。
-
-### MD5 去重
-
-**MD5 特性**：
-
-- 内容完全相同 → MD5 相同 → 跳过
-- 内容有一点点不同（如多一个字）→ MD5 完全不同 → 不会跳过
-
-**双重校验**：
-
-```
-if (md5Store.exists(md5, userId) && vectorStoreService.hasKnowledgeDocument(userId, md5)) {
-    // 跳过：MD5 存在且向量数据存在
-}
-```
-
----
-
-## 四、笔记创建流程（NoteService）
-
-### 流程概述
-
-```
-前端 NoteEditor.vue 点击"保存"
-│  POST /note/create
-│  { title: "RAG学习笔记", content: "# RAG\n\nRAG是..." }
-▼
-NoteController.createNote()
-│  @UserId userId = "user123"
-▼
-NoteService.createNote(userId, request)                ← @Transactional管理事务
-│
-├─ ① 创建 Note 实体
-│     id = UUID (32位)
-│     userId = "user123"
-│     title = "RAG学习笔记"
-│     content = "# RAG\n\nRAG是..."
-│     category = null（用户没传）或 "study"（用户传了）
-│     tags = null（还没生成）
-│
-├─ ② 保存到 MySQL
-│     noteRepository.save(note)
-│     → INSERT INTO notes (id, user_id, title, content, ...) VALUES (...)
-│
-├─ ③ 添加向量索引（切片存储）
-│     vectorStoreService.addNoteVector(note)
-│     → 文本切片（chunkSize=200, overlap=20）
-│     → 同步写入 MySQL NoteChunk 表
-      → 同步写入 BM25 索引
-│     → 异步写入 ChromaDB（noteStore，@Async，失败不影响主流程）
-│     → 写入 BM25 索引
-│     → try-catch 包裹，失败不影响主流程
-│
-├─ ④ 注册事务提交后回调
-│     TransactionSynchronizationManager.registerSynchronization(
-│         afterCommit → self.asyncAutoTagAndReview(noteId, userId, category)
-│     )
-│     → 不是立即执行，而是等事务提交后才触发
-│     → 如果直接调用，会因为当前事务还未提交导致异步任务在MySQL中查不到笔记
-│
-├─ ⑤ 返回 NoteResponse 给前端
-│     { id, title, content, tags:null, category:null, createdAt }
-│
-│   ===== 事务提交 =====
-│
-└─ ⑥ 异步执行 asyncAutoTagAndReview()（taskExecutor 线程池） 
-    │
-    ├─ 6a. 从 MySQL 重新查询笔记（确保数据已提交）
-    │
-    ├─ 6b. 调用 LLM 自动生成标签和分类
-    │       prompt = "请根据以下笔记内容，返回JSON格式的分类结果..."
-    │       LLM 返回: {"category":"study","tags":["RAG","向量检索","LLM"]}
-    │
-    ├─ 6c. 解析 LLM 返回的 JSON
-    │       parseCategory() → "study"（四个默认分类"work", "study", "life", "project"）
-    │       parseTags() → ["RAG", "向量检索", "LLM"]
-    │       如果用户指定了分类 → 优先用用户的
-    │
-    ├─ 6d. 更新笔记的 category 和 tags
-    │       noteRepository.save(note)
-    │       → UPDATE notes SET category='study', tags='["RAG","向量检索","LLM"]' WHERE id=...
-    │
-    └─ 6e. 创建复习记录
-            ReviewRecord:
-              noteId = 笔记ID
-              userId = 用户ID
-              nextReviewAt = 明天（now + 1天）
-              intervalDays = 1
-              reviewCount = 0
-            reviewRecordRepository.save(record)
-```
-
-### 关键代码
-
-```
-@Transactional
-public NoteResponse createNote(String userId, NoteCreate request) {
-    // ① 创建 Note 实体
-    Note note = new Note();
-    note.setId(UUID.randomUUID().toString().replace("-", ""));
-    note.setUserId(userId);
-    note.setTitle(request.getTitle());
-    note.setContent(request.getContent());
-    if (request.getCategory() != null && !request.getCategory().isEmpty()) {
-        note.setCategory(request.getCategory());
-    }
-    
-    // ② 保存到 MySQL
-    note = noteRepository.save(note);
-    
-    // ③ 同步添加向量索引（切片存储）
-    try {
-        vectorStoreService.addNoteVector(note);
-    } catch (Exception e) {
-        log.warn("Failed to add note vector: {}", e.getMessage());
-    }
-    
-    // ④ 注册事务提交后回调
-    String noteId = note.getId();
-    String category = request.getCategory();
-    TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
-        @Override
-        public void afterCommit() {
-            self.asyncAutoTagAndReview(noteId, userId, category);
-        }
-    });
-    
-    // ⑤ 返回响应
-    return toResponse(note);
-}
-```
-
-### @Transactional 工作机制
-
-```
-Spring 为标注了 @Transactional 的 Bean 生成代理对象（JDK 动态代理或 CGLIB 代理）
-
-调用流程：
-外部调用 → 代理对象 → 开启事务 → 执行目标方法 → 正常完成提交事务
-                                              → 抛出异常回滚事务
-
-本质是通过环绕通知（Around Advice）包裹目标方法，把事务管理逻辑和业务逻辑完全解耦
-```
-
----
-
-## 五、向量检索与 BM25 检索
-
-### 5.1 向量检索
-
-**文件路径**：`VectorStoreService.java`
-
-```
-查询文本 → Embedding 模型（智谱 embedding-3）→ 查询向量
-    │
-    ▼
-ChromaDB 向量检索（带 user_id 过滤）→ Top K 结果
-```
-
-**用户隔离**：
-
-```
-Filter filter = new IsEqualTo("user_id", userId);
-EmbeddingSearchRequest request = EmbeddingSearchRequest.builder()
-        .queryEmbedding(queryEmbedding)
-        .maxResults(topK)
-        .filter(filter)
-        .build();
-```
-
-### 5.2 BM25 检索
-
-**文件路径**：`Bm25Service.java`
-
-- 基于 Lucene，每个用户独立的**磁盘持久化索引**（`FSDirectory`）
-- 使用 `StandardAnalyzer`（支持中英文分词）
-- 查询时自动转义特殊字符，防止 Lucene 查询语法注入
-
-### 5.3 知识库和笔记分开检索
-
-**问题**：知识库和笔记是两种不同性质的数据。笔记是用户自己写的，跟用户意图更相关；知识库是外部上传的文档。
-
-**解决**：分开检索，分开精排，最后按分数统一排序。
-
-```
-知识库检索 → RRF 融合 → Cross-Encoder 精排 → topK 条
-笔记检索 → RRF 融合 → Cross-Encoder 精排 → topK 条
-    │
-    ▼
-先按 similarity 优先、再按 rerank_score 和 rrf_score 取分，最终截断为 topK
-```
-
----
-
-## 六、RRF 融合排序
-
-### 是什么
-
-RRF（Reciprocal Rank Fusion）= 逆排名融合。一种将多路检索结果合并排序的算法。
-
-本项目默认 `RRF_K=30`（不是常见示例中的 60），消融配置可以覆盖知识库检索的 rrfK。
-
-RRF 的核心思想：
-
-如果一个文档在多路中都排名靠前，它很可能是好文档
-
-如果一个文档只在一路中排名靠前，可能只是那一路的特殊偏好
-
-RRF 通过累加 1/(60+rank) 来奖励"在多路中出现"的文档
-
-### RRF 公式
-
-```
-score(d) = Σ 1/(k + rank_i(d))
-
-其中：
-- d = 文档
-- k = 默认常数 30，可由知识库消融配置覆盖
-- rank_i(d) = 文档 d 在第 i 路检索结果中的排名（从 1 开始）
-- Σ = 对所有路的分数求和
-```
-
-### 实现细节
-
-```
-private List<Map<String, Object>> rrfFusion(List<List<Map<String, Object>>> allRankings, int topK) {
-    Map<String, Double> rrfScores = new HashMap<>();
-    Map<String, Map<String, Object>> docCache = new HashMap<>();
-
-    for (List<Map<String, Object>> ranking : allRankings) {
-        for (int rank = 0; rank < ranking.size(); rank++) {
-            Map<String, Object> doc = ranking.get(rank);
-            String docKey = getDocKey(doc);
-
-            double rrfScore = 1.0 / (RRF_K + rank + 1);
-            rrfScores.merge(docKey, rrfScore, Double::sum);
-
-            docCache.putIfAbsent(docKey, doc);
-        }
-    }
-
-    return rrfScores.entrySet().stream()
-            .sorted(Map.Entry.<String, Double>comparingByValue().reversed())
-            .limit(topK)
-            .map(entry -> docCache.get(entry.getKey()))
-            .collect(Collectors.toList());
-}
-```
-
----
-
-## 七、Cross-Encoder 精排
-
-### 是什么
-
-对 RRF 融合后的结果使用智谱 AI 的 rerank API 进行重新打分和排序，并过滤低相关性结果。
-
-Rerank模型（Cross-Encoder）会把用户问题和每个候选片段拼在一起输入，深度理解它们之间的语义匹配程度，重新打分排序。最终只保留top-N的高质量片段，把噪声过滤掉。
-
-**那为什么不直接用rerank模型来检索，还要先粗排再精排？**
-
-因为rerank是cross-encoder结构，需要把查询和每个候选拼在一起过模型，计算量比向量检索大得多。如果拿它对百万条数据逐一算分，延迟完全不可接受。所以工程上采用【粗排筛到几十条，精排再从几十条里挑最好的几条】这种两阶段策略，兼顾速度和质量。rerank整体耗时通常在几百毫秒砂以内，对用户体感影响不大，但检索质量的提升非常明显。
-
-### 向量检索 vs Cross-Encoder 的区别
-
-|   |   |   |
-|---|---|---|
-|维度|向量检索（Bi-Encoder）|Cross-Encoder|
-|编码方式|query 和 document 分别编码|query 和 document 一起编码|
-|计算过程|Q → 向量 q，D → 向量 d，计算相似度|(Q, D) → 模型 → 相关性分数|
-|精度|中等|高|
-|速度|快（可预计算 document 向量）|慢（每次都要重新计算）|
-
-**为什么 Cross-Encoder 更准？**
-
-可以捕捉 token 级别的语义交互关系。
-
-例如：查询 "怎么记住东西"，文档 "间隔重复是一种记忆方法"
-
-- 向量检索：二者用词完全不同，可能匹配失败
-- Cross-Encoder：可以识别出 "记住" 和 "记忆" 的语义对应关系，准确判定高相关性
-
-```
-输入：[CLS] 查询文本 [SEP] 文档文本 [SEP]
-      ↓
-┌─────────────────────────────────────────┐
-│  Transformer Encoder                     │
-│  ├─ Self-Attention：query 和 document的每个 token 互相 attend │
-│  │                                       │
-│  │  例如：                               │
-│  │  "什么是向量数据库" 的 "向量"         │
-│  │  可以 attend 到文档中的 "高维向量"    │
-│  │                                       │
-│  └─ 输出：[CLS] token 的表示             │
-└─────────────────────────────────────────┘
-      ↓
-┌─────────────────────────────────────────┐
-│  分类头（Linear Layer）                  │
-│  └─ 输出：相关性分数（0-1）              │
-└─────────────────────────────────────────┘
-
-示例：
-输入："什么是向量数据库" + "向量数据库是一种存储高维向量的数据库"
-输出：0.95
-
-输入："什么是向量数据库" + "关系型数据库使用SQL查询"
-输出：0.12
-```
-
-```
-RRF 融合结果（如 10 条）
-    │
-    ▼
-调用 rerank API 获取精排分数
-    │
-    ▼
-阈值过滤（score < 0.5 的丢弃）
-    │
-    ▼
-按精排分数重新排序
-    │
-    ▼
-取 topN（如 5 条）
-```
-
-动态 top-N 策略：
-
-分数 > 0.7：全部保留
-
-分数 0.5-0.7：最多保留 2 条
-
-分数 < 0.5：丢弃（如果全部被过滤 → 返回RRF原始结果前1条兜底）
-
-### 配置
-
-```
-app:
-  reranker:
-    enabled: true
-    type: ZHIPU
-    api-key: ${ZHIPU_API_KEY}
-    base-url: https://open.bigmodel.cn/api/paas/v4
-    model: rerank
-    score-threshold: 0.5
-    top-n: 5
-```
-
-### 兜底策略
-
-rerank API 调用失败时，返回原始 RRF 结果，不阻断流程。
-
----
-
-## 八、删除流程
-
-### 知识库文档删除
-
-```
-deleteKnowledgeByFilename()
-    │
-    ├─ 1. 尝试删除 ChromaDB
-    │      ├─ 成功 → 继续
-    │      └─ 失败 → 记录到 chroma_cleanup_task 表
-    │
-    ├─ 2. 删除 BM25 索引（按 chunk_id）
-    │
-    ├─ 3. 删除 MySQL（chunks + document）
-    │
-    └─ 4. 删除 MD5 记录
-```
-
-### 笔记删除
-
-```
-NoteService.deleteNote()
-    │
-    ├─ 1. 从 MySQL 删除 Note 记录（@Transactional 事务内）
-    │
-    ├─ 2. 删除关联的复习记录（ReviewRecord）
-    │
-    ├─ 3. 事务提交后 → deleteNoteVector()（异步）
-    │     ├─ 从 MySQL 删除 NoteChunk
-    │     ├─ 删除 BM25 索引（按 chunk_id）
-    │     └─ 尝试删除 ChromaDB（按 note_id 批量删除）
-    │            ├─ 成功 → 继续
-    │            └─ 失败 → 记录到 chroma_cleanup_task 表
-    │                      （taskType="note"，定时重试）
-    │
-    └─ 注意：向量操作失败不阻塞主流程（事务已提交）
-```
-
-### 定时清理任务
-
-```
-ChromaCleanupScheduler
-    │
-    ├─ 每 5 分钟执行
-    │  └─ 查询 chroma_cleanup_task 表中 status="pending" 的任务
-    │     ├─ taskType="knowledge" → REST API 删除 ChromaDB
-    │     └─ taskType="note" → noteStore.remove()
-    │
-    └─ 每天凌晨 3 点
-       └─ 清理超过 7 天的 failed 任务
-```
-
----
-
-## 九、间隔复习流程（ReviewService）
-
-### 流程概述
-
-```
-笔记创建时（自动）
-  │
-  └─ NoteService.asyncAutoTagAndReview()
-     └─ 创建 ReviewRecord: nextReviewAt=明天, intervalDays=1, reviewCount=0
-
-        ... 1天后 ...
-
-用户打开"每日回顾"页面
-  │
-  ├─ GET /review/today
-  │   └─ 查询 nextReviewAt <= 现在 的所有记录
-  │   └─ 返回待复习笔记列表
-  │
-  ├─ 用户点击某篇笔记
-  │   └─ GET /review/question/{noteId}
-  │       └─ 生成复习选择题
-  │
-  ├─ 用户选择答案 → 显示对错
-  │
-  └─ 用户点击"标记已回顾"
-      └─ POST /review/done/{noteId}
-          └─ reviewCount + 1 → 查间隔表 → 更新 nextReviewAt
-```
-
-### 复习间隔序列
-
-```
-1 → 2 → 4 → 7 → 15 → 30 天（艾宾浩斯遗忘曲线，遗忘先快后慢）
-```
-
----
-
-
-
----
-
-## 十、质量审查（QualityReviewer）
-
-> 配置项 `retrieval-review-enabled` 虽然存在且默认关闭，但当前主流程没有调用 `reviewRetrieval()`；实际可见的质量审查发生在 Agent 合成回答阶段，调用 `reviewAnswer()`，审查不通过时重新组织或合成回答。
-
-### 概述
-
-`QualityReviewer` 是一个可选的质量审查组件，可在检索和生成两个阶段对 RAG 输出进行 LLM 驱动的质量审查。配置项默认关闭，但当前主流程未调用检索审查；Agent 合成阶段会调用回答审查。
-
-### 审查流程
-
-```
-用户问题 + 检索结果/生成的回答
-    │
-    ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  QualityReviewer                                                 │
-│                                                                 │
-│  reviewRetrieval(query, documents)                               │
-│  └─ 当前主流程未调用，仅保留为可复用组件                         │
-│  ├─ 检查文档是否为空 → 空则直接不通过                             │
-│  ├─ 调用 LLM（preciseModel）审查文档质量                          │
-│  ├─ 返回 ReviewResult(approved, reason, feedback)                │
-│  └─ feedback 可用于 rewriteQuery() 改写查询后重试                │
-│                                                                 │
-│  reviewAnswer(query, documents, answer)                          │
-│  ├─ 检查回答是否为空 → 空则直接不通过                             │
-│  ├─ 调用 LLM（preciseModel）审查回答忠实度                       │
-│  └─ 返回 ReviewResult(approved, reason, feedback)                │
-│                                                                 │
-│  rewriteQuery(query, feedback)                                   │
-│  └─ 根据审查反馈，用 LLM 改写查询后重新检索                       │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-### 关键特性
-
-- **当前实际行为**：Agent 合成阶段调用回答审查；检索审查方法尚未接入主流程
-- **查询改写方法**：组件提供 rewriteQuery，但当前主流程未形成检索失败后的自动重试链路
-- **默认关闭**：通过 `app.ablation.rag.retrieval-review-enabled` 控制开关（默认 false）
-- **异常安全**：LLM 调用异常时默认通过（approved=true），不阻断主流程
-
-### 配置
-
-```yaml
-app:
-  ablation:
-    rag:
-      retrieval-review-enabled: false  # 默认关闭
-```
-
----
-
-## 十一、SecurityFilterChain 工作机制
-
-```
-HTTP 请求进入 Tomcat
-    │
-    ▼
-┌─ SecurityFilterChain 过滤链 ──────────────────────────────┐
-│                                                           │
-│  Filter 1: CsrfFilter                                     │
-│    └─ 已禁用 (csrf.disable())，直接放行
-              CSRF（Cross-Site Request Forgery，跨站请求伪造）：
-              典型风险存在于 Cookie + Session 认证场景。攻击者利用浏览器自动携带目标站点 
-              Cookie 的特性，诱导用户在已登录状态下，从第三方网站发起非自愿的恶意请求。
-              
-              本项目采用 JWT 无状态认证模式，不依赖 Cookie 会话，因此禁用 CSRF 防护。
-│                                                           │
-│  Filter 2: JwtAuthenticationFilter（自定义）               │
-│    （插在 UsernamePasswordAuthenticationFilter 之前）      │
-│    ├─ 提取 Authorization: Bearer xxx                      │
-│    ├─ 解析 JWT                                            │
-│    │   ├─ 验证签名（HMAC-SHA256，密钥来自配置文件）        │
-│    │   ├─ 检查是否过期                                    │
-│    │   └─ 检查 Redis 黑名单（是否已登出）                  │
-│    ├─ 有效 → SecurityContext.setAuthentication(userId)     │
-│    └─ 无效 → 不设置，交给后续拦截                          │
-│                                                           │
-│  Filter 3: UsernamePasswordAuthenticationFilter           │
-│    └─ 项目中未自定义，使用默认行为                          │
-│                                                           │
-│  Filter 4: ExceptionTranslationFilter                     │
-│    └─ 认证/授权异常时，交给 GlobalExceptionHandler 处理    │
-│                                                           │
-│  Filter 5: FilterSecurityInterceptor                      │
-│    └─ 根据 authorizeHttpRequests 的配置判断权限            │
-│       ├─ /user/login → permitAll → 放行                   │
-│       ├─ /user/register → permitAll → 放行                │
-│       ├─ /health/** → permitAll → 放行                    │
-│       └─ 其他 → authenticated                             │
-│          ├─ SecurityContext 有认证信息 → 放行              │
-│          └─ SecurityContext 无认证信息 → 返回 401          │
-│                                                           │
-└─────────────────────────────┬─────────────────────────────┘
-                              │
-                              ▼
-                    Controller 方法执行
-```
-
-**SSE/异步支持**：`SecurityContextHolder` 设置为 `MODE_INHERITABLETHREADLOCAL`，确保异步线程（SSE、CompletableFuture）也能继承认证信息，避免异步场景下 SecurityContext 丢失。
-
----
-
-
----
-
-## 十二、完整数据流图
-
-```
-用户问题: "怎么提升记忆力"
-    │
-    └─── [Multi-Query] ────────────────────────────────────────
-         LLM 尝试生成最多 3 个扩展版本（提示词要求 10~30 字，代码最多保留 50 字）:
-         Q1: "记忆增强的方法有哪些"
-         Q2: "提高记忆效率的技巧"
-         Q3: "如何改善记忆能力"
-         Q0: "怎么提升记忆力"（原始查询，始终保留）
-                                                
-                         ▼                
-┌───────────────────────────────────────────────────────────────────┐
-│                  混合检索（HybridRetriever）                        │
-│                                                                   │
-│  知识库检索:                                                       │
-│  Q0 ──┬── 向量检索(topK×2) ── BM25(topK×2)                        │
-│  Q1 ──┬── 向量检索(topK×2) ── BM25(topK×2)                        │
-│  Q2 ──┬── 向量检索(topK×2) ── BM25(topK×2)                        │
-│  Q3 ──┬── 向量检索(topK×2) ── BM25(topK×2)                        │
-│          │                                                        │
-│          ▼ 最多 8×topK 个候选                                      │
-│        RRF 融合 → 去重 → 按 RRF 分数排序 → topK×2 条               │
-│          │                                                        │
-│          ▼ Cross-Encoder 精排（rerank API）                        │
-│          ├─ 动态 top-N：score>0.7 全保留                           │
-│          ├─ 0.5≤score≤0.7 最多保留2条                             │
-│          └─ score<0.5 丢弃（全部过滤则取 RRF 第1条兜底）           │
-│        最终 topK 条知识库文档                                       │
-│                                                                   │
-│  笔记检索:（同理，topK 可独立配置）                                  │
-│        RRF 融合 → 精排 → 最终 topK 条笔记                          │
-└──────────────────────────────┬────────────────────────────────────┘
-                               │
-                               ▼
-                      合并结果，按 similarity （余弦相似度）
-                      降序排列，统一取 topK
-                               │
-                               ▼
-┌───────────────────────────────────────────────────────────────────┐
-│  构建 Prompt（直接拼接，无 MapReduce）                              │
-│                                                                   │
-│  带来源标注版（默认）:                                              │
-│  [来源：笔记《xxx》] 内容...                                       │
-│  [来源：知识库《xxx》] 内容...                                     │
-│                                                                   │
-│  无来源标注版（消融实验 R-6）:                                     │
-│  直接拼接文档内容                                                  │
-└──────────────────────────────┬────────────────────────────────────┘
-                               │
-                               ▼
-┌───────────────────────────────────────────────────────────────────┐
-│  系统提示词 + 拼接好的参考资料 + 用户问题 → LLM 一次调用生成回答    │
-│                                                                   │
-│  System: 你是一个智能笔记助手...                                    │
-│  User:   参考资料：...
-
-用户问题：...                             │
-│                                                                   │
-│  ↓ 一次 LLM 调用                                                   │
-│                                                                   │
-│  最终回答:                                                         │
-│  "提升记忆力有几种经过验证的方法：                                   │
-│   1. 间隔重复：按照遗忘曲线安排复习时间...                           │
-│   2. 充足睡眠：睡眠期间大脑会巩固记忆...                             │
-│   3. 记忆宫殿：将信息与空间位置关联..."                              │
-│                                                                   │
-│  来源: 笔记《学习方法总结》、知识库《认知心理学》                     │
-└───────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 十三、三端数据同步流程详解
-
----
-
-### 同步上传流程
-
-#### 知识库文档上传
-
-```
-用户上传文件
-    │
-    ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  DocumentProcessor.processFile()                                │
-│  ├─ 计算 MD5                                                    │
-│  ├─ MD5 去重检查（跳过已存在的文档）                              │
-│  ├─ Tika 解析提取文本                                            │
-│  └─ 中文感知切片                                                 │
-└─────────────────────────────────────────────────────────────────┘
-    │
-    ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  VectorStoreService.addKnowledgeDocument()  【同一事务】         │
-│                                                                 │
-│  ① 写入 MySQL（同步，事务保证）                                  │
-│     ├─ INSERT knowledge_document（status="processing"）         │
-│     └─ INSERT knowledge_document_chunk（多条）                  │
-│                                                                 │
-│  ② 写入 BM25 索引（同步，同一事务）                              │
-│     └─ 逐个 chunk 写入 Lucene 磁盘索引                          │
-│                                                                 │
-│  ③ 保存 MD5 记录（同步）                                         │
-│     └─ md5Store.save(md5, filename, userId)                     │
-│                                                                 │
-│  ===== 事务提交 =====                                            │
-│                                                                 │
-│  ④ 异步写入 ChromaDB（DocumentTaskExecutor，独立线程）          │
-│     ├─ 批量 Embedding（每批 10 条）                              │
-│     ├─ 分批写入 ChromaDB                                         │
-│     ├─ 成功 → 更新 status = "completed"                         │
-│     └─ 失败 → 更新 status = "vector_failed"                     │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-**关键点**：
-
-- MySQL 和 BM25 写入在**同一事务**中，保证原子性
-- MD5 记录也在事务后同步保存
-- ChromaDB 写入是**异步**的（DocumentTaskExecutor），失败不影响主流程
-- 状态在 `addKnowledgeDocument` 中设为 `processing`，由 `DocumentTaskExecutor` 异步更新为 `completed` 或 `vector_failed`
-
----
-
-#### 笔记创建
-
-```
-用户创建笔记
-    │
-    ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  NoteService.createNote()  【@Transactional】                   │
-│                                                                 │
-│  ① 写入 MySQL                                                   │
-│     ├─ INSERT note（标题、内容、分类）                            │
-│     └─ INSERT note_chunk（切片内容，多条）                       │
-│                                                                 │
-│  ② 添加向量索引（addNoteVector）                                │
-│     ├─ 文本切片（chunkSize=200, overlap=20）                     │
-│     ├─ 写入 MySQL NoteChunk（同步）                              │
-│     ├─ 写入 BM25 索引（同步）                                     │
-│     └─ 异步写入 ChromaDB（writeNoteToChromaAsync）               │
-│                                                                 │
-│  ③ 注册事务提交后回调                                            │
-│     └─ afterCommit → asyncAutoTagAndReview()                    │
-│        ├─ LLM 自动生成标签和分类                                 │
-│        └─ 创建复习记录                                           │
-└─────────────────────────────────────────────────────────────────┘
-```
-
----
-
-### 同步删除流程
-
-#### 知识库文档删除
-
-```
-用户删除文档
-    │
-    ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  VectorStoreService.deleteKnowledgeByFilename()  【@Transactional】
-│                                                                 │
-│  ① 查询 MySQL 获取文档信息                                       │
-│     ├─ docId（文档ID）                                           │
-│     ├─ md5（内容哈希）                                           │
-│     └─ userId（用户ID）                                          │
-│                                                                 │
-│  ② 尝试删除 ChromaDB                                            │
-│     ├─ 调用 REST API：POST /api/v1/collections/{id}/delete      │
-│     ├─ 请求体：{"where": {"doc_id": "xxx"}}                     │
-│     ├─ 成功 → 继续                                               │
-│     └─ 失败 → 记录到 chroma_cleanup_task 表                     │
-│        └─ INSERT cleanup_task (docId, userId, taskType="knowledge")
-│                                                                 │
-│  ③ 删除 BM25 索引（同步）                                       │
-│     └─ 遍历所有 chunk，逐个删除                                  │
-│        for (chunk : chunks) {                                   │
-│            chunkKey = md5 + "_" + chunkIndex                    │
-│            bm25Service.deleteDocument(userId, chunkKey)         │
-│        }                                                        │
-│                                                                 │
-│  ④ 删除 MySQL（同步）                                           │
-│     ├─ DELETE knowledge_document_chunk WHERE document_id = ?    │
-│     └─ DELETE knowledge_document WHERE id = ?                   │
-│                                                                 │
-│  ⑤ 删除 MD5 记录                                                │
-│     └─ md5Store.deleteByMd5(md5, userId)                        │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-**关键点**：
-
-- **ChromaDB 删除（REST API）**首先尝试，失败不阻塞主流程，记录到 cleanup_task 表待重试
-- ChromaDB 失败时记录到 `cleanup_task` 表，定时重试
-- BM25 删除是**同步**的，按 chunk_id 逐个删除
-
----
-
-#### 笔记删除
-
-```
-用户删除笔记
-    │
-    ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  NoteService.deleteNote()（外层事务）                             │
-│                                                                 │
-│  ① 删除 MySQL 中的 Note 记录                                    │
-│     └─ DELETE note WHERE id = ?                                 │
-│                                                                 │
-│  ② 删除关联的复习记录（ReviewRecord）                            │
-│     └─ DELETE review_record WHERE note_id = ?                   │
-│                                                                 │
-│  ===== 事务提交 =====                                            │
-│                                                                 │
-│  ③ 事务提交后 → deleteNoteVector()                              │
-│                                                                 │
-│  VectorStoreService.deleteNoteVector()：                        │
-│  ├─ ④ 查询 MySQL 获取 chunks（用于 BM25 删除键）                │
-│  │     └─ SELECT note_chunk WHERE note_id = ?                   │
-│  ├─ ⑤ 删除 BM25 索引（按 chunkIndex）                           │
-│  │     └─ bm25Service.deleteDocument(userId, chunkKey)          │
-│  ├─ ⑥ 从 MySQL 删除 NoteChunk                                    │
-│  │     └─ DELETE note_chunk WHERE note_id = ?                   │
-│  └─ ⑦ 尝试删除 ChromaDB（REST API）                             │
-│        ├─ 调用 POST /api/v1/collections/{id}/delete             │
-│        ├─ 成功 → 继续                                            │
-│        └─ 失败 → 记录到 chroma_cleanup_task 表                  │
-│           └─ INSERT cleanup_task（taskType="note"）             │
-└─────────────────────────────────────────────────────────────────┘
-```
-
----
-
-### 同步更新流程
-
-#### 笔记更新
-
-```
-用户编辑笔记
-    │
-    ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  NoteService.updateNote()  【@Transactional】                   │
-│                                                                 │
-│  ① 检查内容是否变化                                              │
-│     ├─ 标题变化 → 需要更新向量                                   │
-│     ├─ 内容变化 → 需要更新向量                                   │
-│     └─ 都没变 → 跳过向量更新                                     │
-│                                                                 │
-│  ② 如果内容变化：删除旧向量                                      │
-│     ├─ deleteNoteVector(noteId, userId)                         │
-│     │   ├─ 删除 MySQL NoteChunk                                 │
-│     │   ├─ 删除 ChromaDB 向量                                   │
-│     │   └─ 删除 BM25 索引                                       │
-│     └─ addNoteVector(note)                                      │
-│         ├─ 切片 → 写入 MySQL NoteChunk                          │
-│         ├─ 异步写入 ChromaDB                                     │
-│         └─ 写入 BM25 索引                                       │
-│                                                                 │
-│  ③ 更新 MySQL Note 表                                           │
-│     └─ UPDATE note SET title=?, content=?, ... WHERE id=?       │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-**关键点**：
-
-- 笔记更新是**先删后增**，不是直接更新向量
-- 只有内容变化才触发向量更新
-- 标签和分类更新不触发向量重建
-
----
-
-#### 知识库文档更新
-
-**当前实现**：没有直接的更新逻辑
-
-```
-用户重新上传同名文件
-    │
-    ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  DocumentProcessor.processFile()                                │
-│                                                                 │
-│  ① 计算 MD5                                                     │
-│     └─ 新文件的 MD5 = "abc123"                                  │
-│                                                                 │
-│  ② MD5 去重检查                                                 │
-│     ├─ md5Store.exists(md5, userId) → true（旧文件 MD5 相同）    │
-│     └─ vectorStoreService.hasKnowledgeDocument() → true         │
-│     → 跳过，不处理                                               │
-│                                                                 │
-│  如果内容不同（MD5 不同）：                                       │
-│     ├─ md5Store.exists() → false                                │
-│     └─ 当作新文件处理，旧数据不会被删除                           │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-**问题**：
-
-- 同名文件、内容不同 → MD5 不同 → 当作新文件，旧数据残留
-- 没有按 filename 更新的逻辑
-
----
-
-### 定时重试流程
-
-```
-ChromaCleanupScheduler（每 5 分钟执行）
-    │
-    ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  查询 cleanup_task 表                                            │
-│  └─ SELECT * FROM chroma_cleanup_task WHERE status = 'pending'  │
-│                                                                 │
-│  遍历每个任务：                                                   │
-│  ├─ taskType = "knowledge"                                      │
-│  │   └─ vectorStoreService.deleteFromChromaByDocId(docId)       │
-│  │       └─ 调用 REST API 删除 ChromaDB                         │
-│  │                                                              │
-│  └─ taskType = "note"                                           │
-│      └─ vectorStoreService.deleteNoteFromStore(noteId)          │
-│          └─ noteStore.remove(noteId)                            │
-│                                                                 │
-│  结果处理：                                                       │
-│  ├─ 成功 → DELETE cleanup_task WHERE id = ?                     │
-│  └─ 失败 → UPDATE retry_count + 1                              │
-│          └─ retry_count >= 10 → status = 'failed'              │
-└─────────────────────────────────────────────────────────────────┘
-
-每天凌晨 3 点清理过期任务
-    │
-    ▼
-DELETE FROM chroma_cleanup_task 
-WHERE status = 'failed' AND created_at < NOW() - 7 DAY
-```
-
----
-
-### 三端数据状态对照表
-
-|   |   |   |   |
-|---|---|---|---|
-|场景|MySQL|ChromaDB|BM25|
-|**正常上传**|✅ 已写入|✅ 已写入|✅ 已写入|
-|**ChromaDB 写入失败**|✅ 已写入（status=vector_failed）|❌ 未写入|✅ 已写入|
-|**正常删除**|✅ 已删除|✅ 已删除|✅ 已删除|
-|**ChromaDB 删除失败**|✅ 已删除|❌ 残留（待重试）|✅ 已删除|
-|**重试成功**|✅ 已删除|✅ 已删除|✅ 已删除|
-|**重试失败（超过10次）**|✅ 已删除|❌ 残留（标记failed）|✅ 已删除|
-
----
-
-### 数据一致性保障机制
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                     数据一致性保障                               │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  【写入时】                                                      │
-│  ├─ MySQL + BM25：同一事务，原子性保证                            │
-│  ├─ ChromaDB：异步写入，失败标记 vector_failed                    │
-│  └─ 状态机：processing → completed / vector_failed              │
-│                                                                 │
-│  【删除时】                                                      │
-│  ├─ MySQL：优先删除，保证主流程可用                               │
-│  ├─ BM25：同步删除                                               │
-│  ├─ ChromaDB：失败记录到 cleanup_task 表                         │
-│  └─ 定时重试：每 5 分钟重试，最多 10 次                          │
-│                                                                 │
-│  【最终一致性】                                                  │
-│  ├─ ChromaDB 写入失败：用户手动重试                              │
-│  ├─ ChromaDB 删除失败：定时任务自动重试                           │
-│  └─ 残留数据：超过 7 天的 failed 任务自动清理                     │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
-
----
-
-### 流程图总结
-
-```
-                    上传流程                    删除流程
-                        │                           │
-                        ▼                           ▼
-              ┌─────────────────┐         ┌─────────────────┐
-              │   MySQL 写入    │         │  ChromaDB 删除  │
-              │  (事务保证)     │         │  (尝试删除)     │
-              └────────┬────────┘         └────────┬────────┘
-                       │                           │
-              ┌────────┴────────┐         ┌────────┴────────┐
-              │                 │         │                 │
-              ▼                 ▼         ▼                 ▼
-    ┌─────────────┐   ┌─────────────┐   ┌─────────┐   ┌─────────┐
-    │ ChromaDB    │   │   BM25      │   │  成功   │   │  失败   │
-    │ (异步写入)  │   │  (同步写入) │   │  继续   │   │记录重试 │
-    └─────────────┘   └─────────────┘   └─────────┘   └────┬────┘
-                                                           │
-              ┌────────────────────────────────────────────┘
-              ▼
-    ┌─────────────────┐         ┌─────────────────┐
-    │   BM25 删除     │ ──────▶ │   MySQL 删除    │
-    │   (同步删除)    │         │  (优先删除)     │
-    └─────────────────┘         └─────────────────┘
-```
-
-## 十四、各环节的兜底策略汇总
-
-|   |   |   |
-|---|---|---|
-|环节|可能的故障|兜底方案|
-|Query 扩展|LLM API 失败|仅使用原始查询|
-|向量检索（知识库）|ChromaDB 连接失败|降级为 MySQL + 余弦相似度|
-|向量检索（笔记）|ChromaDB 连接失败|返回空列表|
-|BM25 检索|Lucene 异常|返回空列表，不阻断流程|
-|Cross-Encoder 精排|rerank API 失败|返回原始 RRF 结果|
-|笔记向量写入|ChromaDB 不可用|跳过向量写入，只写 MySQL 和 BM25|
-|知识库向量写入|ChromaDB 失败|标记 status="vector_failed"，支持重试|
-|整个检索|没搜到任何文档|返回"未找到相关文档"|
-|删除 ChromaDB|删除失败|记录到 cleanup_task 表，定时重试|
-|删除 ChromaDB|重试超过 10 次|标记 status="failed"，不再重试|
-|删除 ChromaDB|残留超 7 天|每天凌晨 3 点自动清理 failed 记录|
-
-## 十五、Ragas评估流程
-
-当前评估并非直接接入前端 Agent/SSE 链路。RegressionTestService 直接调用 RagService.getDocumentsAndSummary()，再手动构造 RagTrace，调用 EvaluationService.evaluate()；因此回归测试覆盖检索和生成，但不覆盖 Supervisor、AgentLoop、Composer、Writer、SSE 和 Agent 质量审查。生产 trace 由 RagService 保存，记录查询、检索文档预览、耗时、平均相似度、最终回答和 token 消耗。
-
-```
-RagTrace (查询记录)
-  │
-  │ 包含: query, retrievedDocs, finalAnswer, groundTruth(可选)
+```text
+前端 AIChat.vue
   │
   ▼
-┌──────────────────────────────────────────────────┐
-│           EvaluationService.evaluate()            │
-│                                                   │
-│  并行执行 LLM 评估 (CompletableFuture)：           │
-│                                                   │
-│  ┌─────────────────┐  ┌─────────────────────┐   │
-│  │ 1. Faithfulness │  │ 2. Answer Relevancy │   │
-│  │    忠实度        │  │    答案相关性        │   │
-│  │                 │  │                     │   │
-│  │ 声明拆分+逐条   │  │ 反向生成3个问题     │   │
-│  │ SUPPORTED/      │  │ 计算与原问题的      │   │
-│  │ NOT_SUPPORTED   │  │ 语义相似度平均值    │   │
-│  └────────┬────────┘  └──────────┬──────────┘   │
-│           │                      │               │
-│  ┌────────┴────────┐  ┌─────────┴───────────┐   │
-│  │ 3. Context      │  │ 4. Context Recall   │   │
-│  │    Precision    │  │    上下文召回率      │   │
-│  │    上下文精确度  │  │    (需Ground Truth) │   │
-│  │                 │  │                     │   │
-│  │ 位置加权精确度  │  │ 标准答案拆句        │   │
-│  │ Precision@k     │  │ 判断上下文是否支持   │   │
-│  └────────┬────────┘  └─────────┬───────────┘   │
-│           │                      │               │
-│  ┌────────┴──────────────────────┴────────────┐ │
-│  │           规则评估 (ruleEvaluate)            │ │
-│  │                                             │ │
-│  │  - 耗时 > 15s → -20分                       │ │
-│  │  - 检索为空 → -30分                          │ │
-│  │  - 回答 < 20字 → -15分                       │ │
-│  │  - 平均相似度 < 0.3 → -15分                  │ │
-│  └──────────────────┬────────────────────────┘ │
-│                     ▼                           │
-│  ┌──────────────────────────────────────────┐  │
-│  │          综合评分计算                      │  │
-│  │                                           │  │
-│  │  LLM加权分 = faithfulness×W1 + relevancy×W2│  │
-│  │             + precision×W3 + recall×W4     │  │
-│  │                                           │  │
-│  │  最终分 = 调和平均数(LLM加权分, 规则分)     │  │
-│  │                                           │  │
-│  │  评级: ≥90优秀, ≥75良好, ≥60及格, <60不及格│  │
-│  └──────────────────┬───────────────────────┘  │
-│                     ▼                           │
-│  ┌──────────────────────────────────────────┐  │
-│  │          自动诊断 (diagnose)               │  │
-│  │                                           │  │
-│  │  - 精度+召回都低 → Embedding/Chunk/召回策略│  │
-│  │  - 精度低 → 优化Reranker或TopK             │  │
-│  │  - 召回低 → 优化Query扩展或降低阈值        │  │
-│  │  - 忠实度低 → 幻觉，优化Prompt或换模型      │  │
-│  │  - 相关性低+忠实度高 → 检索文档不对         │  │
-│  └──────────────────────────────────────────┘  │
-└──────────────────────────────────────────────────┘
+POST /chat/agent/query/stream
+  │
+  ▼
+ChatController.agentQueryStream()
+  │
+  ▼
+AgentService.streamAgentResponse()
+  │
+  ├─ 保存用户消息
+  ├─ 处理附件上下文
+  ├─ resolveReferences() 解析会话引用
+  ├─ 根据开关过滤工具
+  ├─ 判断是否启用 Supervisor
+  ▼
+AgentRuntime.start()
+  │
+  ▼
+AgentLoop / 运行时多轮工具调用
+  │
+  ├─ 需要知识检索时调用 AgentTools.ragSummary()
+  ▼
+RagService.getDocumentsAndSummary()
+  │
+  ▼
+HybridRetriever.searchKnowledge()/searchNotes()
+  │
+  ▼
+QueryExpander
+  │
+  ▼
+向量检索 + BM25 检索 + RRF 融合 + Reranker 精排
+  │
+  ▼
+RagService 生成知识摘要
+  │
+  ▼
+ResponseComposer.compose()
+  │
+  ▼
+QualityReviewer.reviewAnswer()
+  │
+  ▼
+AgentService 按 50 字符切块，通过 SSE 返回
+```
+
+### 2. 兼容链路：直连 RAG
+
+```text
+POST /chat/rag/query
+  │
+  ▼
+ChatController.ragQuery()
+  │
+  ▼
+ChatService.ragQuery()
+  │
+  ▼
+RagService.ragSummary()/getDocumentsAndSummary()
+  │
+  ▼
+直接返回结果
+```
+
+这条链路还在，但不是主入口。
+
+---
+
+## 三、主流程总览
+
+### 1. 用户请求进入 Agent
+
+`ChatController.agentQueryStream()` 会接收这些关键参数：
+
+- `query`
+- `sessionId`
+- `enableKnowledge`
+- `enableNotes`
+- `selectedKnowledgeDocs`
+- `selectedNotes`
+- `fileIds`
+- `regenerate`
+
+`AgentService.streamAgentResponse()` 里会先做几件事：
+
+1. 按开关过滤工具。`ragSummary` 只有启用知识库或笔记时才可用。
+2. 把附件文本拼到用户问题前面。
+3. 结合会话上下文做引用解析。
+4. 判断要不要走 Supervisor 拆任务。
+5. 创建 AgentTask 和 Trace。
+6. 启动 `AgentRuntime.start()`。
+
+### 2. Agent 决定是否调用 RAG
+
+当前不是每次都强制走 RAG。是 Agent 自己在循环里决定要不要调工具。
+
+只要问题需要知识库/笔记证据，通常会调用：
+
+- `ragSummary`
+
+然后 RAG 返回知识摘要，进入最终答案合成。
+
+### 3. 最终不是 RAG 直接输出
+
+这点要记住。
+
+当前主流程里，`RagService` 生成的是一份“知识摘要/证据总结”，最终面向用户的输出通常还会再经过：
+
+- `ResponseComposer.compose()`
+- `QualityReviewer.reviewAnswer()`
+
+所以用户最终看到的内容，常常不是 RAG 单次直出原文，而是 Agent 层加工后的答案。
+
+---
+
+## 四、当前 RAG 检索与生成流程
+
+### 流程图
+
+```text
+用户问题
+  │
+  ▼
+QueryExpander.expand()
+  │
+  ├─ 原始查询必保留
+  └─ 最多再生成 3 个扩展查询
+  ▼
+HybridRetriever
+  │
+  ├─ 知识库：向量检索 + BM25
+  ├─ 笔记：向量检索 + BM25
+  ├─ 异常时降级到关键词检索
+  └─ 多路结果做融合
+  ▼
+RRF 融合 / simpleMerge
+  │
+  ▼
+RerankerService.rerank()
+  │
+  ▼
+RagService 合并知识库和笔记结果
+  │
+  ▼
+expandRetrievedContexts() 扩展邻域上下文
+  │
+  ▼
+拼接参考资料上下文
+  │
+  ▼
+调用 LLM 生成 summary
+  │
+  ▼
+Agent 侧再组织最终回答
 ```
 
 ---
+
+## 五、Query 扩展
+
+代码：`backend-java/src/main/java/com/rag/notebook/rag/QueryExpander.java`
+
+当前实现要点：
+
+- 原始查询始终保留
+- 最多额外生成 3 个扩展查询
+- 扩展走 `creativeModel`
+- 查询缓存 key 前缀：`query-cache:query-expansion`
+- 缓存 30 分钟
+- 输入过长时，只截前 100 个字符喂给扩展模型
+- 单条扩展结果超过 50 字会被截断
+- 失败时只用原始查询
+
+### 实际行为
+
+```text
+原始 query
+  │
+  ├─ 查缓存，命中直接返回
+  ├─ 未命中则调用 creativeModel
+  ├─ 解析返回的多行文本
+  ├─ 去重、去空、最多保留 3 条扩展
+  └─ 和原始 query 一起组成最多 4 条查询
+```
+
+### 和旧笔记不同地方
+
+旧笔记里“10~30 字”是提示词要求，不是硬校验规则。
+真正代码约束是：
+
+- 输入最多 100 字
+- 扩展结果最多 50 字
+- 总数最多 4 条（含原始查询）
+
+---
+
+## 六、混合检索
+
+代码：`backend-java/src/main/java/com/rag/notebook/rag/HybridRetriever.java`
+
+当前检索分两支：
+
+- `searchKnowledge()`
+- `searchNotes()`
+
+两支逻辑基本同构。
+
+### 1. 检索组件开关
+
+`HybridRetriever` 支持这些组件开关：
+
+- Query Expansion
+- Vector Search
+- BM25 Search
+- RRF Fusion
+- Rerank
+
+开关来源：
+
+- 有消融配置时优先用 `AblationConfig`
+- 没有时用 `application.yml` 默认配置
+
+### 2. 知识库检索
+
+每个 query 版本，最多走两路：
+
+1. 向量检索
+2. BM25 检索
+
+每路取：
+
+- `effectiveTopK * 2`
+
+如果指定了 `selectedKnowledgeDocs`，还会先把用户传入的 ID、md5、filename、originalFilename 归一化，再做过滤。
+
+### 3. 笔记检索
+
+笔记也一样：
+
+1. 向量检索
+2. BM25 检索
+
+每路同样默认取 `topK * 2` 候选，再做融合和精排。
+
+### 4. 为什么知识库和笔记分开检索
+
+现在项目里不是把所有内容先扔一起再搜。
+而是：
+
+- 知识库单独检索一套
+- 笔记单独检索一套
+- 最后 `RagService` 才把两边结果合并排序
+
+这样做原因很直接：
+
+- 笔记是用户自己的内容，语义通常更贴近个人表达
+- 知识库是上传文档，规模更大、噪声更高
+- 分开粗排和精排，最后再统一排序，更容易控质量
+
+---
+
+## 七、向量检索、BM25、关键词兜底
+
+### 1. 向量检索
+
+代码：`VectorStoreService.searchKnowledge()`、`VectorStoreService.searchNotes()`
+
+基本流程：
+
+```text
+查询文本
+  │
+  ▼
+EmbeddingModel 生成 query embedding
+  │
+  ▼
+ChromaDB collection 检索
+  │
+  ▼
+按 user_id 过滤
+  │
+  ▼
+返回 TopK 结果
+```
+
+知识库和笔记各用一个 collection：
+
+- `knowledgeStore`
+- `noteStore`
+
+### 2. BM25 检索
+
+代码：`Bm25Service`
+
+当前是 Lucene 磁盘索引，不是内存版。
+
+特点：
+
+- 每个用户独立索引
+- 支持中英文分词
+- 文档写入和删除都跟业务数据同步走
+- 检索异常时不会直接炸主流程
+
+### 3. 关键词检索兜底
+
+`HybridRetriever` 里已经加了关键词兜底：
+
+- 知识库：`keywordFallbackKnowledge()`
+- 笔记：`keywordFallbackNotes()`
+
+触发场景：
+
+1. Chroma 不可用，且向量路关闭
+2. BM25 检索异常
+3. 各路结果全空，需要退到纯关键词检索
+
+这点比旧笔记更准确。旧笔记主要写了“MySQL + 余弦相似度”降级，但当前主检索流程里，真正挂在 `HybridRetriever` 上的兜底更直接的是 `KeywordSearchService`。
+
+---
+
+## 八、RRF 融合
+
+代码：`HybridRetriever.rrfFusion()`
+
+当前默认常量：
+
+- `DEFAULT_RRF_K = 30`
+
+不是 60。
+
+### 公式
+
+```text
+score(d) = Σ 1 / (rrfK + rank + 1)
+```
+
+### 实际行为
+
+- 只在多路结果大于 1 路时用 RRF
+- 如果关闭 RRF，走 `simpleMerge()`
+- `simpleMerge()` 是去重后按原始分数排序，不做融合分累加
+
+### simpleMerge 不是 RRF
+
+这个要单独记。
+
+当前项目里，RRF 可以被消融关闭。
+关闭后不是“还用别的高级融合算法”，而是很朴素地：
+
+- 去重
+- 按 similarity 排序
+- 截断 topK
+
+---
+
+## 九、Cross-Encoder 精排
+
+代码：`backend-java/src/main/java/com/rag/notebook/rag/RerankerService.java`
+
+当前接智谱 rerank API。
+
+### 流程
+
+```text
+融合后的候选文档
+  │
+  ▼
+按文档内容拼成 documents 数组
+  │
+  ▼
+POST {baseUrl}/rerank
+  │
+  ▼
+拿到每条候选的 relevance_score
+  │
+  ▼
+按 rerank_score 降序重排
+  │
+  ▼
+动态 top-N 过滤
+```
+
+### 动态 top-N 规则
+
+当前真实规则：
+
+- `score > 0.7`：全部保留
+- `0.5 <= score <= 0.7`：最多保留 2 条
+- `score < 0.5`：丢弃
+
+注意一处和旧笔记不同：
+
+旧笔记写了“如果全部被过滤，返回 RRF 原始结果前 1 条兜底”。
+当前 `RerankerService.dynamicTopN()` 代码里没有这段兜底逻辑。
+
+真实情况是：
+
+- rerank API 调用失败，返回原始 documents
+- rerank API 成功但所有分数都低于阈值，可能直接返回空列表
+
+这点很关键，旧笔记写错了。
+
+---
+
+## 十、RagService 如何合并结果并生成摘要
+
+代码：`backend-java/src/main/java/com/rag/notebook/rag/RagService.java`
+
+### 1. 检索
+
+`RagService.retrieveDocuments()` 会按开关决定是否搜索：
+
+- 知识库
+- 笔记
+
+然后把两边结果合并。
+
+### 2. 排序规则
+
+合并后排序优先级实际是：
+
+1. `similarity`
+2. 没有时看 `rerank_score`
+3. 再没有时看 `rrf_score`
+
+代码在 `scoreOf()`。
+
+### 3. 截断
+
+合并后统一截断到：
+
+- `topK`
+
+### 4. 邻域扩展
+
+不是直接把命中 chunk 原样拿去拼 Prompt。
+还会调用：
+
+- `vectorStoreService.expandRetrievedContexts(allResults)`
+
+也就是命中后还会扩展相邻 chunk 或同 section 上下文，减少信息断裂。
+
+### 5. 拼接 Prompt
+
+`RagService` 会把最终文档拼成：
+
+- 带来源版 `buildContext()`
+- 不带来源版 `buildContextPlain()`
+
+然后构造：
+
+```text
+参考资料：
+<context>
+
+用户问题：<query>
+```
+
+再交给聊天模型生成 summary。
+
+### 6. 结果为空时
+
+如果检索结果为空，直接返回：
+
+- `未找到相关文档。`
+
+不会再强行让 LLM 编。
+
+---
+
+## 十一、Agent 侧为什么和纯 RAG 不一样
+
+当前主链路里，RAG 只是证据生产环节，不是最终话术输出环节。
+
+`AgentService.composeAndReview()` 真实流程：
+
+1. 从 Agent 状态抽取证据 `EvidencePack`
+2. `ResponseComposer.compose()` 生成回答
+3. 组装审查证据列表
+4. `QualityReviewer.reviewAnswer()` 审查回答
+5. 审查不通过时，再次 compose 一次
+
+所以现在主流程更像：
+
+```text
+RAG 提供证据
+  +
+Agent 负责表达
+  +
+LLM 负责忠实度复核
+```
+
+不是老式“RAG 检索完，Prompt 一拼，最终答案直接回用户”。
+
+---
+
+## 十二、文档入库流程
+
+代码：`backend-java/src/main/java/com/rag/notebook/rag/DocumentProcessor.java`
+
+### 当前真实流程
+
+```text
+用户上传文件
+  │
+  ▼
+DocumentProcessor.processFile()
+  │
+  ├─ 1. 计算 MD5
+  ├─ 2. 查 knowledge_document 是否已存在相同 md5
+  ├─ 3. 提取文本
+  ├─ 4. RagChunker.splitKnowledge() 切片
+  ├─ 5. MySQL + BM25 同步写入
+  └─ 6. DocumentTaskExecutor 异步写入 ChromaDB
+```
+
+### 文本提取
+
+- PDF：`PDFBox` 按页抽取，保留 `[Page x/y]`
+- 其他格式：`Apache Tika`
+- PDF 文本会做 `NFKC` 归一化，避免兼容字形影响检索
+
+### 切片
+
+知识库不再是旧版简单字符串切片。
+现在走：
+
+- `RagChunker.splitKnowledge()`
+
+切片里会保留：
+
+- `content`
+- `retrievalText`
+- `contentType`
+- `pageStart/pageEnd`
+- metadata
+
+### 写入顺序
+
+同步阶段：
+
+1. MySQL 写 `KnowledgeDocument`
+2. MySQL 写 `KnowledgeDocumentChunk`
+3. BM25 写 Lucene 索引
+
+异步阶段：
+
+4. `DocumentTaskExecutor.writeToChromaAsync()` 写 ChromaDB
+5. 成功则文档状态完成，失败则标记 `vector_failed`
+
+### 去重
+
+当前代码直接查：
+
+- `documentRepository.existsByUserIdAndMd5(userId, md5)`
+
+旧笔记里“md5Store + MySQL 双重校验”已经不是当前主实现描述重点。
+当前看代码，核心去重依据就是知识文档表里的用户级 MD5 唯一性。
+
+---
+
+## 十三、笔记入库流程
+
+代码：`backend-java/src/main/java/com/rag/notebook/note/service/NoteService.java`
+
+### 创建笔记
+
+```text
+POST /note/create
+  │
+  ▼
+NoteService.createNote()
+  │
+  ├─ 1. 保存 Note 到 MySQL
+  ├─ 2. 清理列表缓存
+  ├─ 3. vectorStoreService.addNoteVector(note)
+  ├─ 4. 注册 afterCommit 回调
+  └─ 5. 事务提交后异步执行自动打标和复习记录创建
+```
+
+### addNoteVector 实际做什么
+
+代码：`VectorStoreService.addNoteVector()`
+
+```text
+Note 内容
+  │
+  ▼
+RagChunker.splitNote()
+  │
+  ├─ 写 NoteChunk 到 MySQL
+  ├─ 写 BM25 索引
+  └─ Chroma 可用时异步写入 noteStore
+```
+
+### 自动标签和复习
+
+事务提交后，`asyncAutoTagAndReview()` 会：
+
+1. 重新查 note
+2. 调 LLM 生成分类和 tags
+3. 更新 note
+4. 创建 `ReviewRecord`
+
+默认复习起点：
+
+- 明天
+- `intervalDays = 1`
+- `reviewCount = 0`
+
+---
+
+## 十四、删除与一致性流程
+
+### 1. 知识库删除
+
+代码：`VectorStoreService.deleteKnowledgeByFilename()`
+
+当前真实顺序：
+
+```text
+按 filename 查文档
+  │
+  ├─ 先删 BM25
+  ├─ 再删 MySQL 文档
+  └─ 最后删 ChromaDB
+       ├─ 成功：结束
+       └─ 失败：写 chroma_cleanup_task
+```
+
+这里和很多笔记里“先删 Chroma 再删 MySQL”不一样。
+当前代码是：
+
+- 主流程优先保证 MySQL + BM25 清掉
+- Chroma 失败走补偿任务
+
+### 2. 笔记删除
+
+代码：`NoteService.deleteNote()`
+
+真实顺序：
+
+```text
+删除 Note
+  │
+  ├─ 清缓存
+  ├─ 删除 review_record
+  └─ afterCommit 后调用 vectorStoreService.deleteNoteVector()
+         ├─ 先查 NoteChunk
+         ├─ 删除 BM25
+         ├─ 删除 MySQL NoteChunk
+         └─ 删除 ChromaDB，失败写 cleanup task
+```
+
+### 3. 为什么这样设计
+
+因为当前项目明确采用：
+
+- MySQL/BM25 优先保证主流程一致
+- Chroma 用异步补偿追最终一致性
+
+这是典型“主存储强一致，向量库最终一致”。
+
+---
+
+## 十五、Chroma 清理重试
+
+代码：`backend-java/src/main/java/com/rag/notebook/rag/ChromaCleanupScheduler.java`
+
+### 定时任务
+
+1. 每 5 分钟跑一次 pending 任务
+2. 每天凌晨 3 点清理 7 天前 failed 任务
+
+### pending 任务处理
+
+- `taskType = note`：删笔记向量
+- 其他：按知识库文档删 Chroma 记录
+
+失败时：
+
+- `retryCount + 1`
+- 达到 `maxRetry` 后标记 `failed`
+
+所以当前删除策略很清楚：
+
+- 不因为 Chroma 失败卡死业务删除
+- 后台反复补偿
+
+---
+
+## 十六、Review 复习流程
+
+代码：`backend-java/src/main/java/com/rag/notebook/review/service/ReviewService.java`
+
+### 今日复习列表
+
+接口：`GET /review/today`
+
+逻辑：
+
+- 查 `nextReviewAt <= now` 的记录
+- 拼出笔记标题、预览、标签、分类、复习次数等
+- 带缓存，TTL 10 分钟
+
+### 标记已复习
+
+接口：`POST /review/done/{noteId}`
+
+当前间隔数组：
+
+```text
+[1, 2, 4, 7, 15, 30]
+```
+
+逻辑：
+
+1. `reviewCount + 1`
+2. 取下一复习间隔
+3. 更新 `lastReviewedAt`
+4. 更新 `nextReviewAt`
+5. 清掉今日复习缓存
+
+### 生成题目
+
+接口：`GET /review/question/{noteId}`
+
+流程：
+
+- 校验 note 权限
+- 截取最多 2000 字内容
+- 异步调用 LLM 生成 4 选 1 单选题
+- 优先按行文本格式解析，JSON 作为兜底
+
+---
+
+## 十七、质量审查现状
+
+代码：`backend-java/src/main/java/com/rag/notebook/rag/QualityReviewer.java`
+
+当前要点：
+
+- `reviewRetrieval()` 组件存在
+- 但主 RAG 流程里没有自动接入“检索失败后重写 query 再检索”闭环
+- 主链路里真正用到的是 `reviewAnswer()`
+- 它挂在 `AgentService.composeAndReview()` 里
+
+所以现在“质量审查”实际含义是：
+
+- 回答阶段有审查
+- 检索阶段预留了审查能力，但还不是默认主链路
+
+---
+
+## 十八、评估链路现状
+
+代码：
+
+- `RegressionTestService`
+- `EvaluationService`
+
+当前评估不是从前端 Agent 全链路采样。
+而是：
+
+1. 回归测试直接调用 `RagService.getDocumentsAndSummary()`
+2. 手动构造 `RagTrace`
+3. 再交给 `EvaluationService.evaluate()`
+
+所以它覆盖的是：
+
+- 检索
+- 生成
+
+不覆盖：
+
+- Supervisor
+- AgentLoop
+- ResponseComposer
+- WriterService
+- SSE 输出
+- Agent 侧回答审查
+
+这个边界要分清。
+
+---
+
+## 十九、当前项目最准确的一版总流程
+
+```text
+用户在前端发起问题
+  │
+  ▼
+/chat/agent/query/stream
+  │
+  ▼
+ChatController
+  │
+  ▼
+AgentService
+  │
+  ├─ 处理会话、附件、工具开关、任务追踪
+  └─ 启动 Agent Runtime
+  ▼
+AgentLoop
+  │
+  ├─ 简单问题可直接答
+  └─ 需要知识证据时调用 ragSummary
+  ▼
+RagService
+  │
+  ├─ QueryExpander 生成多查询版本
+  ├─ HybridRetriever 分别检索知识库和笔记
+  │    ├─ 向量检索
+  │    ├─ BM25
+  │    ├─ 关键词兜底
+  │    ├─ RRF 融合或 simpleMerge
+  │    └─ Reranker 精排
+  ├─ 合并知识库和笔记结果
+  ├─ expandRetrievedContexts 扩展邻域上下文
+  ├─ 拼接参考资料 Prompt
+  └─ 调 LLM 生成 summary
+  ▼
+Agent 收到 summary 作为证据
+  │
+  ▼
+ResponseComposer.compose()
+  │
+  ▼
+QualityReviewer.reviewAnswer()
+  │
+  ▼
+按 50 字符切块，通过 SSE 发送给前端
+```
+
+---
+
+## 二十、和旧笔记相比，必须修正点
+
+### 1. 主入口变了
+
+不是“前端直接调 RAG”。
+主入口是：
+
+- `POST /chat/agent/query/stream`
+
+### 2. 最终回答不是 RagService 直接给用户
+
+主链路里还会经过：
+
+- `ResponseComposer`
+- `QualityReviewer.reviewAnswer()`
+
+### 3. RRF 常量是 30，不是 60
+
+真实代码：
+
+- `DEFAULT_RRF_K = 30`
+
+### 4. rerank 全部低分时，没有代码级前 1 条兜底
+
+真实代码没有这个兜底。
+只在 rerank API 失败时返回原始结果。
+
+### 5. 文档切片不是旧版简单文本切片
+
+当前知识库走：
+
+- `RagChunker.splitKnowledge()`
+
+笔记走：
+
+- `RagChunker.splitNote()`
+
+### 6. 主检索兜底已经落到关键词检索服务
+
+不是只写“MySQL + 余弦相似度降级”就够。
+当前 `HybridRetriever` 真正挂载的是 `KeywordSearchService` 兜底。
+
+### 7. 删除流程是主存储优先，Chroma 补偿
+
+不是所有地方都“先删 Chroma 再删业务数据”。
+当前核心设计是：
+
+- MySQL/BM25 优先
+- Chroma 失败进 cleanup task
+
+---
+
+## 二十一、面试时可直接复述版
+
+这项目现在是 Agent 驱动 RAG，不是传统纯 RAG 直出。
+主入口在 `/chat/agent/query/stream`。请求先进 `AgentService`，Agent 在运行时判断要不要调用 `ragSummary` 工具；一旦调用，就进入 `RagService`。`RagService` 先做 Query 扩展，再由 `HybridRetriever` 对知识库和笔记分别做向量检索与 BM25 检索，多路结果用 RRF 融合，再交给 reranker 做 Cross-Encoder 精排。之后 `RagService` 把命中 chunk 的邻域上下文扩展开，拼参考资料 Prompt，调用模型生成知识摘要。这个摘要回到 Agent 层后，不是直接返回，而是再经过 `ResponseComposer` 组织成最终回答，并由 `QualityReviewer.reviewAnswer()` 做回答忠实度审查，最后通过 SSE 分块发给前端。
+
+入库这边，知识库文档先抽文本再走 `RagChunker.splitKnowledge()`，同步写 MySQL 和 BM25，Chroma 向量异步写；笔记则在保存 Note 后走 `splitNote()`，同步写 `NoteChunk` 和 BM25，Chroma 异步写。删除时以 MySQL 和 BM25 为主，Chroma 删除失败写入 `chroma_cleanup_task`，由定时任务做最终一致性补偿。
