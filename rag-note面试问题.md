@@ -14,7 +14,8 @@
 
 #### 1. 介绍一下你这个项目的整体架构？
 
-这个项目是一个基于 RAG 架构的智能笔记系统，核心就是"先检索、后生成"。整体分成三层：存储层用 MySQL 存笔记和聊天记录，ChromaDB 存向量索引做语义搜索，Lucene 做 BM25 关键词索引，三端保持同步；检索层是整套管线的核心，用户提问后先经过 LLM 做 Query 扩展改写多个版本，然后向量检索和 BM25 并行跑，结果通过 RRF 算法融合排序，再用 Cross-Encoder 做一次精排；生成层把检索到的相关文档拼上系统提示词交给 LLM 生成最终回答。用户上传文档时经过 Tika 解析文本、中文分块、批量向量化后同步写入这三端，整个流程是异步处理的，不影响用户正常使用。
+这个项目是一个基于 RAG 架构的智能笔记系统，核心就是"先检索、后生成"。
+整体分成三层：存储层用 MySQL 存笔记和聊天记录，ChromaDB 存向量索引做语义搜索，Lucene 做 BM25 关键词索引，三端保持同步；检索层是整套管线的核心，用户提问后先经过 LLM 做 Query 扩展改写多个版本，然后向量检索和 BM25 并行跑，结果通过 RRF 算法融合排序，再用 Cross-Encoder 做一次精排；生成层把检索到的相关文档拼上系统提示词交给 LLM 生成最终回答。用户上传文档时经过 Tika 解析文本、中文分块、批量向量化后同步写入这三端，整个流程是异步处理的，不影响用户正常使用。
 
 Agent 系统采用模块化架构，核心分为九个子包共 69 个 Java 文件。核心执行层包括 AgentService 主入口、AgentLoop 目标驱动循环、AgentState 状态容器、AgentTools 工具定义。运行时子系统包括 AgentRuntime 任务编排、AgentTaskService 生命周期管理、ReflectionService 反思机制、ReplanningService 重规划、ToolExecutionService 工具执行封装。可观测性层包括 AgentTrace 全链路追踪、AgentMetrics 指标统计。策略控制层通过 AgentPolicyService 和 BudgetConfig 限制轮次、时间、Token、工具调用次数。动态工具扩展通过 Skill 包系统支持 Git 导入和 Skill Center 安装。整个系统支持任务持久化、暂停/恢复、全链路追踪，实现了从"黑盒执行"到"全链路可观测"的演进。
 
@@ -22,17 +23,188 @@ Agent 系统采用模块化架构，核心分为九个子包共 69 个 Java 文�
 
 ## 三、技术选型
 
-#### 2. 为什么用 ChromaDB 而不是 Milvus、Pinecone 这些？
+#### 2. 为什么用 ChromaDB，而不是 Milvus、Pinecone 这些？
 
-选 ChromaDB 主要是看中它轻量，Docker 一行命令就能启动，适合我们这种中小项目。它支持 REST API，Java 端通过 HTTP 调用很方便，而且 LangChain4j 原生集成了 ChromaDB，开发成本很低。Milvus 更适合大规模场景，比如亿级向量检索，我们项目目前还没到那个量级；Pinecone 是云服务，有成本不说，数据还得存到别人那里。所以 ChromaDB 对我们来说是够用且最省事的选择，等以后量真上来了再迁移也不迟。
+我们选择 ChromaDB，主要还是结合项目的**规模、部署成本和开发效率**来考虑。
+
+当时项目的数据量属于中小规模，并没有达到需要专门部署向量数据库集群的程度。ChromaDB 比较轻量，部署和使用都比较简单，Java 端通过 HTTP 就可以调用，而且我们使用的 LangChain4j 也有对应的集成，所以开发成本比较低。
+
+Milvus 更偏向大规模向量检索场景，能力比较完整，但对于我们当前的规模来说，部署和运维成本相对更高。Pinecone 属于云端托管服务，虽然使用方便，但会涉及云服务成本以及企业数据存储的问题。
+
+所以当时的选择不是说 ChromaDB 一定比 Milvus 好，而是**当前项目规模下，ChromaDB 已经能够满足需求，同时开发和维护成本更低**。如果后续数据量和并发规模明显增长，再考虑迁移到更适合大规模场景的方案。
+
+**可能追问：**
+
+- **如果数据量达到百万级，你还会继续用 ChromaDB 吗？**：我会重新评估。如果出现明显的性能、并发或者扩展性瓶颈，会考虑迁移到 Milvus、Elasticsearch/OpenSearch 等更适合生产规模的方案。
+    
+- **为什么不用 Pinecone？**：主要考虑企业项目的数据存储和成本问题，而且当前规模并不需要额外引入云端托管服务。
+    
+- **迁移向量数据库困难吗？**：如果业务层不直接依赖具体数据库实现，而是封装统一的向量检索接口，迁移主要就是重新构建 embedding 索引和替换底层实现。
+    
+
+**补充细节：**
+
+你可以简单理解成：
+
+```text
+ChromaDB
+→ 轻量
+→ 部署简单
+→ 适合中小规模
+→ 开发成本低
+
+Milvus
+→ 更偏大规模
+→ 分布式能力更强
+→ 运维成本也更高
+
+Pinecone
+→ 云端托管
+→ 使用方便
+→ 但有成本和数据存储方面的考虑
+```
+
+面试的时候重点不要说“ChromaDB 性能比 Milvus 好”，而是说：
+
+> **“不是技术能力的绝对比较，而是根据当前项目规模选择合适的复杂度。”**
 
 #### 3. 为什么用 Lucene 做 BM25，而不是 Elasticsearch？
 
-Elasticsearch 虽然功能强大，但它是个独立服务，需要额外部署和维护，对我们这个场景来说太重了。Lucene 是嵌入式的，直接在 Java 进程内运行，不需要额外搭一套集群。而且我们做了按用户隔离索引，每个用户一个独立的 FSDirectory，重启后自动加载，不需要复杂的集群管理。如果未来数据量到百万级别，那时候再考虑迁移到 Elasticsearch 也不晚。
+主要是因为我们这个项目的 BM25 检索规模并不大，而且检索服务和 Java 后端本身结合比较紧密，所以选择了 Lucene。
+
+Lucene 本身就是 Elasticsearch 底层使用的核心搜索库之一，它提供了完整的倒排索引和 BM25 能力。直接使用 Lucene，可以把检索能力集成到 Spring Boot 服务里，不需要额外部署 Elasticsearch 集群，整体架构更简单。
+
+项目中我们还按照用户维度对索引进行隔离，每个用户维护自己的索引目录，服务重启后可以重新加载，所以当前规模下 Lucene 已经能够满足需求。
+
+如果后续数据量、并发量明显增长，或者需要分布式检索、集群管理和更复杂的搜索能力，再考虑迁移到 Elasticsearch 会更合适。
+
+**可能追问：**
+
+- **Lucene 和 Elasticsearch 是什么关系？**：Lucene 是底层搜索引擎库，提供倒排索引、BM25 等核心能力；Elasticsearch 在 Lucene 之上提供了分布式、REST API、集群管理等完整搜索服务能力。
+    
+- **为什么不直接用 Elasticsearch？**：不是 Elasticsearch 不好，而是当前项目规模不大，直接使用 Lucene 可以减少一个独立服务，降低部署和维护成本。
+    
+- **Lucene 适合什么场景？**：比较适合单机或者嵌入式搜索场景。如果需要多节点、分片、水平扩展和比较复杂的搜索服务，就更适合 Elasticsearch 这类独立搜索服务。
+    
+
+**补充细节：**
+
+可以这样理解：
+
+```text
+Lucene：
+
+Spring Boot
+   ↓
+Lucene
+   ↓
+倒排索引 + BM25
+```
+
+而 Elasticsearch 更像：
+
+```text
+Spring Boot
+   ↓ HTTP
+Elasticsearch 集群
+   ↓
+Lucene
+   ↓
+倒排索引 + BM25
+```
+
+所以你这里选择 Lucene，本质上是：
+
+> **我们只需要 Lucene 的搜索能力，但暂时不需要 Elasticsearch 提供的分布式服务能力。**
+
+这里还有一个面试注意点：**不要说“百万级一定必须 Elasticsearch”**。是否需要迁移应该看数据量、QPS、P99、内存、索引构建时间以及是否需要水平扩展，而不是只看数据条数。
 
 #### 4. Embedding 模型用的什么？为什么选它？
 
-我们用的是智谱 AI 的 embedding-3 模型，输出维度是 1024。选它的主要原因是中文效果好，因为我们的笔记和文档基本都是中文的；API 也稳定，单条延迟大概 50 毫秒；还支持批量调用，一批能处理 10 条，能大幅减少请求次数；成本也可控。我们也考虑过本地模型比如 M3E，但自己部署和调优的成本比较高，而且本地小模型的效果跟云端比还是有差距，所以最终选了 API 方式。
+我们项目使用的是**智谱 AI 的 Embedding-3 模型**，主要考虑三个方面。
+
+第一是**中文语义效果**。我们的知识库主要是中文研发文档，所以比较关注中文技术文本的语义表示效果。
+第二是**工程接入成本**。使用 API 的方式接入比较简单，不需要自己部署和维护模型服务，同时支持批量调用，也比较方便放到异步的向量化流程里。
+第三是**成本和效果的平衡**。当时对比过本地模型，比如 M3E，本地部署虽然数据可控，但还需要自己承担模型部署、资源占用和调优成本。在当前项目规模下，使用云端 Embedding API 能够比较快地完成知识库向量化，所以最终选择了这个方案。
+
+**可能追问：**
+
+- **为什么不用本地 Embedding 模型？**：本地模型的优势是数据不需要离开自己的环境，而且长期大规模调用可能更可控，但需要承担 GPU/CPU 资源、部署和模型调优成本。当前项目更关注开发效率，所以选择 API。
+    
+- **怎么判断 Embedding 模型好不好？**：不能只看模型参数或者维度，主要还是放到自己的业务数据上评估，比如 Recall@K、MRR，以及最终问答效果。不同模型可以使用同一批测试数据进行对比。
+    
+- **Embedding 维度越高是不是越好？**：不一定。维度更高不代表一定检索效果更好，同时还会增加存储和计算成本，所以应该结合实际数据集测试效果，而不是单纯追求高维度。
+    
+
+**补充细节：**
+
+Embedding 可以简单理解成：
+
+```text
+“Redis 是什么？”
+       ↓
+Embedding 模型
+       ↓
+[0.12, -0.31, 0.58, ...]
+       ↓
+存入 ChromaDB
+```
+
+用户以后问：
+
+```text
+“Redis 主要有什么作用？”
+```
+
+虽然两句话的字面表达不完全一样，但 Embedding 模型可能会把它们映射到比较接近的向量空间，于是向量检索就能把相关 Chunk 找出来。
+
+整个知识库流程就是：
+
+```text
+文档
+ ↓
+解析 / 切片
+ ↓
+Embedding
+ ↓
+向量
+ ↓
+ChromaDB
+
+用户问题
+ ↓
+Embedding
+ ↓
+向量相似度检索
+ ↓
+相关 Chunk
+```
+
+这里要注意一个非常容易被追问的问题：
+
+> **Embedding 模型和 LLM 不是一回事。**
+
+Embedding 模型负责的是：
+
+> **“这段文本和另一段文本在语义上有多接近？”**
+
+LLM 负责的是：
+
+> **“结合这些资料，我应该怎么理解并回答用户？”**
+
+所以你的 RAG 链路可以理解成：
+
+```text
+用户问题
+   ↓
+Embedding
+   ↓
+向量检索 ───┐
+            ├→ RRF → Rerank → LLM → 答案
+BM25 ───────┘
+```
+
+这样面试官如果继续从 **Embedding → ChromaDB → 混合检索 → Rerank → LLM** 往下追，你也能比较自然地接住。
 
 ---
 
@@ -358,25 +530,151 @@ BudgetConfig 可以按用户、按任务类型配置不同的阈值。比如普�
 
 #### 56. ReflectionService 什么时候触发？反思结果怎么用？
 
-ReflectionService 在 AgentLoop 连续无进展时触发。具体判断逻辑是：AgentState.consecutiveNoProgress >= 2，即连续两轮没有新的工具调用、证据增长或目标推进。触发后调用 `reflectionService.reflect(state, query)`，把当前的 goal、toolHistory、failedActions、observations 发给 LLM，让它分析"为什么卡住了"。
+ReflectionService 主要在 AgentLoop 执行过程中出现**连续无进展或者工具重复失败**时触发。目前的判断条件包括连续两轮没有明显进展，或者同一个工具连续失败。
 
-LLM 返回 ReflectionResult，包含 problem（卡住的原因，如"工具参数错误"、"目标不明确"、"工具不可用"）、suggestedStrategies（建议的替代策略列表，如"换用 searchNotes 模糊搜索"、"先调 listNotes 浏览候选"）。这个结果持久化到 AgentReflection 表，避免同一任务重复分析。
+触发后，ReflectionService 会把当前任务的 goal、工具调用历史、失败记录和观察结果交给 LLM，让它分析当前为什么没有继续推进，并返回问题原因、建议策略以及是否需要调整执行策略。
 
-反思结果有两个用途。一是注入到 AgentState.workingMemory，作为"已知经验"供后续轮次参考。二是触发 ReplanningService.replan()，基于反思结果生成新的执行计划，更新 AgentState.pendingSteps，引导后续轮次按新策略执行。反思内容也会记录到 AgentTrace.reflections，方便回溯"第几轮触发了反思、LLM 给了什么建议"。
+反思结果主要有两个作用：一是记录到 AgentState 的工作记忆 `AgentState.workingMemory`中，让后续轮次知道之前哪里失败过；二是触发后续的策略调整，让 Agent 下一轮尽量避免重复之前的失败路径。反思结果和重规划过程也会记录到 Trace，方便后面排查 Agent 为什么卡住。
 
-这个机制的价值在于：旧版只注入"当前状态"让 LLM 自己想办法，但 LLM 可能反复尝试同一失败路径。新版通过额外的 LLM 调用做元认知分析，明确指出"这条路不通、建议换这条路"，引导 LLM 跳出局部循环。
+这个机制主要解决的是**Agent 陷入局部循环的问题**。比如之前一直用 `getNote` 获取内容但参数始终不对，普通 Agent 可能会重复尝试；反思后可以明确发现问题，并提示下一轮改用 `searchNotes` 或先搜索候选内容。
+
+**可能追问：**
+
+- **ReflectionResult 的 `shouldReplan` 怎么判断？**：主要由 LLM 根据当前执行状态判断是否需要调整策略，同时代码对 URL 被拦截、连续无进展等明确场景也有回退判断，避免完全依赖模型。
+    
+- **如果反思之后还是没有效果怎么办？**：当前 AgentLoop 本身有最大执行轮次限制，达到上限后会终止执行；对于关键前置步骤失败的情况，Runtime 还可以直接进入 `NEED_CLARIFICATION`，让用户补充信息。目前没有单独实现 `MAX_REPLAN_COUNT`，所以不能说已经有完整的重规划次数控制。
+    
+
+**补充细节：**
+
+这里的“反思”可以简单理解成：
+
+```text
+正常执行
+   ↓
+连续失败 / 无进展
+   ↓
+ReflectionService
+   ↓
+分析：为什么失败？
+   ↓
+ReflectionResult
+   ↓
+告诉 Agent：
+“之前这条路不行，可以尝试另一种方式”
+   ↓
+继续执行
+```
+
+需要特别注意：**当前实现中的 Replanning 并不是重新生成一套完整的 SubTask 计划。** AgentLoop 中的重规划主要是把反思结果和当前状态重新注入上下文，让 LLM 在下一轮选择不同的工具或策略。
 
 #### 57. ReplanningService 跟 Supervisor 有什么区别？
 
-Supervisor 是任务入口时的初始规划，ReplanningService 是执行过程中的动态调整，两者触发时机和输入信息完全不同。
+两者最大的区别是**触发时机和负责的层级不同**。
 
-Supervisor 在 AgentRuntime.start() 时调用，输入只有用户原始查询和对话历史，判断是否需要拆分子任务、执行模式是 SEQUENTIAL 还是 PARALLEL。它是"事前规划"，基于静态信息做决策，不知道执行过程中会遇到什么问题。规划结果是 List<SubTask>，每个子任务有独立的 goal、toolHint、successCriteria。
+Supervisor 是任务开始时的初始规划，主要根据用户的问题判断是否需要拆分任务，并生成多个 SubTask，同时确定任务之间的依赖关系和执行模式。它解决的是**整个任务应该怎么拆、怎么组织**。
 
-ReplanningService 在 AgentLoop 连续无进展时调用，输入包含当前 AgentState（已调用工具、失败记录、观察结果）和 ReflectionResult（反思分析）。它是"事中调整"，基于实际执行反馈调整策略，知道"哪些尝试失败了、为什么失败、现在卡在哪"。调整结果是更新 AgentState.pendingSteps，不会重新拆分子任务，只是告诉当前 AgentLoop"接下来按这个新思路走"。
+ReplanningService 则是在 Agent 执行过程中发现问题后，对当前执行策略进行调整。它会结合当前 AgentState 和 ReflectionResult，告诉 Agent 当前哪里出了问题、后面可以尝试什么不同的策略。它解决的是**当前这个子任务接下来应该怎么走**。
 
-两者的粒度也不同。Supervisor 拆的是语义级别的子目标（"搜索笔记 → 生成导图 → 写回笔记"），每个子目标是独立的 AgentLoop。ReplanningService 调整的是单个 AgentLoop 内部的执行步骤（"换用 searchNotes 而不是 getNote"），不会跨 AgentLoop 重新编排。
+所以两者的粒度也不同。Supervisor 是比较高层的任务编排，比如：
 
-一句话总结：Supervisor 是战略层规划（拆成几个子任务、依赖关系），ReplanningService 是战术层调整（当前子任务内换条路走）。
+```text
+用户问题
+  ↓
+Supervisor
+  ↓
+Task A：搜索相关资料
+Task B：分析资料
+Task C：生成结果
+```
+
+而 Replanning 更像是：
+
+```text
+Task A 执行
+  ↓
+发现 searchNotes 失败
+  ↓
+Reflection
+  ↓
+Replanning
+  ↓
+改用其他搜索策略
+```
+
+所以我一般会把它理解成：**Supervisor 是事前的战略规划，Replanning 是执行过程中的战术调整。**
+
+**可能追问：**
+
+- **Replanning 会重新生成 SubTask 吗？**：目前不会。Supervisor 负责生成和拆分 SubTask，Replanning 主要调整当前 AgentLoop 的执行策略，不会重新编排整个 Supervisor-Worker 任务树。
+    
+	**那为什么Replanning 不设置成重新生成一套完整的 SubTask 计划呢？**：**主要是因为 Supervisor 和 Replanning 解决的问题不同。** Supervisor 负责的是任务级别的拆分，如果执行过程中只是某一个 Worker 的工具调用失败或者策略不合适，没有必要把整个任务重新拆一遍。
+	比如 Supervisor 已经把任务拆成“搜索资料 → 分析资料 → 生成结果”，如果只是“搜索资料”这个子任务里的某个工具调用失败，这时候更合理的是在当前 Worker 内部换一种搜索方式，而不是重新让 Supervisor 把整个任务重新规划一次。
+	另外，重新生成完整 SubTask 计划会带来更大的上下文和执行成本，还可能导致原来已经完成的任务被重复执行。所以目前设计成**局部策略调整**，尽量复用已经完成的结果，只调整当前卡住的执行路径。
+	如果以后出现的是**任务目标发生变化、多个 Worker 都失败，或者当前任务依赖关系本身有问题**，那时候再考虑升级到 Supervisor 级别的全局 Replanning 会更合适。
+	
+- **如果重规划之后还是失败怎么办？**：当前主要依靠 AgentLoop 的最大轮次限制；如果是关键的 FETCH 前置步骤失败，Runtime 会直接进入 `NEED_CLARIFICATION`，让用户介入，而不是继续无限尝试。
+    
+- **为什么不每次失败都重规划？**：因为反思和重规划本身也需要额外的 LLM 调用。如果只是一次临时的工具失败就重新规划，会增加 Token、延迟和系统开销，所以目前是在连续无进展或明确失败的情况下触发。
+    
+
+**补充细节：**
+
+你可以把两者简单记成：
+
+```text
+Supervisor
+   ↓
+“这个大问题应该怎么拆？”
+   ↓
+SubTask A / B / C
+```
+
+而：
+
+```text
+Replanning
+   ↓
+“当前这个子任务走不通了，下一步换什么方法？”
+```
+
+还有一个非常重要的代码层面区别：
+
+**AgentLoop 里的 Replanning 和 AgentRuntime 里的关键步骤失败处理不是完全一回事。**
+
+AgentLoop 中：
+
+```text
+反思
+ ↓
+ReplanningService
+ ↓
+更新执行上下文 / 注入状态
+ ↓
+继续下一轮 Agent Loop
+```
+
+也就是说，它主要是**调整当前 Agent 的行为，引导下一轮换策略**。
+
+而 AgentRuntime 对关键 FETCH 步骤达到 `MAX_ROUNDS` 并确认失败时，目前的处理更加保守：
+
+```text
+FETCH 失败
+ ↓
+Runtime 判断关键步骤失败
+ ↓
+NEED_CLARIFICATION
+ ↓
+任务暂停 / 用户介入
+```
+
+因此面试时最好不要说：
+
+> “重规划失败后会不断生成新的计划。”
+
+更准确的说法是：
+
+> **“当前版本的重规划主要是执行策略层面的调整，不是重新生成整个 SubTask 计划；如果继续执行仍然无法推进，会受到最大轮次限制，关键前置步骤失败则会进入 NEED_CLARIFICATION。”**
 
 ---
 
